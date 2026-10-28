@@ -1,0 +1,445 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   AUTOWORKER — Enterprise Design System Foundation
+   Digital Operations Workplace · Single Source of Truth
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Formal CSS Design Tokens ─────────────────────────────────────────── */
+:root {
+  /* Surfaces */
+  --aw-bg:              #07080c;
+  --aw-obsidian:        #07080c;
+  --aw-surface-base:    #0b0d13;
+  --aw-graphite:        #0e1017;
+  --aw-graphite-mid:    #131620;
+  --aw-graphite-high:   #181c28;
+  --aw-surface-hover:   #1d2232;
+
+  /* Borders & Dividers */
+  --aw-border-subtle:   rgba(255, 255, 255, 0.05);
+  --aw-border:          rgba(255, 255, 255, 0.08);
+  --aw-border-strong:   rgba(255, 255, 255, 0.16);
+  --aw-border-focus:    rgba(0, 194, 212, 0.45);
+
+  /* Typography */
+  --font-display:       'Outfit', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-body:          'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono:          'JetBrains Mono', 'Fira Code', Menlo, monospace;
+
+  /* Text Colors */
+  --aw-text-primary:    #f4f2ee;
+  --aw-offwhite:        #f4f2ee;
+  --aw-text-secondary:  #a5a8b5;
+  --aw-offwhite-dim:    rgba(244, 242, 238, 0.72);
+  --aw-text-muted:      #686b78;
+  --aw-coolgray:        #8e92a4;
+  --aw-coolgray-dim:    rgba(142, 146, 164, 0.4);
+
+  /* Primary Accent: Restrained Electric Teal */
+  --aw-teal:            #00c2d4;
+  --aw-teal-dim:        rgba(0, 194, 212, 0.10);
+  --aw-teal-subtle:     rgba(0, 194, 212, 0.04);
+  --aw-teal-border:     rgba(0, 194, 212, 0.28);
+  --aw-teal-hover:      #1ad3e4;
+
+  /* Semantic Status Colors */
+  --aw-green:           #1db87a;
+  --aw-green-dim:       rgba(29, 184, 122, 0.10);
+  --aw-green-border:    rgba(29, 184, 122, 0.25);
+
+  --aw-amber:           #e8942a;
+  --aw-amber-dim:       rgba(232, 148, 42, 0.10);
+  --aw-amber-border:    rgba(232, 148, 42, 0.28);
+
+  --aw-red:             #ef4444;
+  --aw-red-dim:         rgba(239, 68, 68, 0.10);
+  --aw-red-border:      rgba(239, 68, 68, 0.28);
+
+  --aw-purple:          #8b64d4;
+  --aw-purple-dim:      rgba(139, 100, 212, 0.10);
+  --aw-purple-border:   rgba(139, 100, 212, 0.28);
+
+  --aw-blue:            #3b82f6;
+  --aw-blue-dim:        rgba(59, 130, 246, 0.10);
+  --aw-blue-border:     rgba(59, 130, 246, 0.25);
+
+  /* Spacing Scale */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+  --space-16: 64px;
+
+  /* Controlled Radius Scale */
+  --r-none: 0px;
+  --r-sm:   4px;
+  --r-md:   6px;
+  --r-lg:   8px;
+  --r-xl:   12px;
+  --r-full: 9999px;
+
+  /* Elevation Hierarchy */
+  --elevation-0: none;
+  --elevation-1: 0 1px 3px rgba(0, 0, 0, 0.4), 0 0 0 1px var(--aw-border);
+  --elevation-2: 0 8px 24px rgba(0, 0, 0, 0.6), 0 0 0 1px var(--aw-border);
+  --elevation-3: 0 24px 60px rgba(0, 0, 0, 0.8), 0 0 0 1px var(--aw-border-strong);
+
+  /* Motion Curves */
+  --ease-standard:    cubic-bezier(0.2, 0, 0, 1);
+  --ease-decelerate:  cubic-bezier(0, 0, 0.2, 1);
+  --ease-accelerate:  cubic-bezier(0.3, 0, 1, 1);
+  --dur-fast:         150ms;
+  --dur-normal:       250ms;
+  --dur-slow:         400ms;
+}
+
+/* ── Reset & Intrinsic Layout Baseline ─────────────────────────────────── */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  font-size: 16px;
+  scroll-behavior: smooth;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  background: var(--aw-bg);
+  color: var(--aw-text-primary);
+}
+
+body {
+  background: var(--aw-bg);
+  color: var(--aw-text-primary);
+  font-family: var(--font-body);
+  font-size: 0.875rem;
+  line-height: 1.55;
+  overflow-x: hidden;
+  min-height: 100vh;
+}
+
+/* Text Wrapping & Zero-Clipping Strict Enforcement */
+p, h1, h2, h3, h4, h5, h6, span, td, th {
+  overflow-wrap: break-word;
+  word-break: normal;
+}
+
+/* Interactive elements base */
+button, input, select, textarea {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+/* ── Typography Utilities ──────────────────────────────────────────────── */
+.aw-display {
+  font-family: var(--font-display);
+  font-size: clamp(2.5rem, 5vw, 4.25rem);
+  font-weight: 700;
+  letter-spacing: -0.04em;
+  line-height: 0.98;
+  color: var(--aw-text-primary);
+}
+
+.aw-h1 {
+  font-family: var(--font-display);
+  font-size: clamp(1.5rem, 2.8vw, 2.25rem);
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  line-height: 1.15;
+  color: var(--aw-text-primary);
+}
+
+.aw-h2 {
+  font-family: var(--font-display);
+  font-size: 1.25rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.3;
+  color: var(--aw-text-primary);
+}
+
+.aw-h3 {
+  font-family: var(--font-body);
+  font-size: 1rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.4;
+  color: var(--aw-text-primary);
+}
+
+.aw-body {
+  font-family: var(--font-body);
+  font-size: 0.875rem;
+  font-weight: 400;
+  line-height: 1.55;
+  color: var(--aw-text-secondary);
+}
+
+.aw-small {
+  font-family: var(--font-body);
+  font-size: 0.75rem;
+  line-height: 1.5;
+  color: var(--aw-coolgray);
+}
+
+.aw-label {
+  font-family: var(--font-body);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--aw-coolgray);
+}
+
+.aw-mono {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  color: var(--aw-text-secondary);
+}
+
+/* ── Surface Utilities ─────────────────────────────────────────────────── */
+.aw-surface {
+  background: var(--aw-graphite);
+  border: 1px solid var(--aw-border);
+  border-radius: var(--r-md);
+}
+
+.aw-surface-subtle {
+  background: var(--aw-surface-base);
+  border: 1px solid var(--aw-border-subtle);
+  border-radius: var(--r-md);
+}
+
+.aw-surface-elevated {
+  background: var(--aw-graphite-mid);
+  border: 1px solid var(--aw-border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--elevation-2);
+}
+
+.aw-glass {
+  background: rgba(14, 16, 23, 0.82);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--aw-border);
+}
+
+/* ── Button System ─────────────────────────────────────────────────────── */
+.aw-btn-primary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-radius: var(--r-md);
+  background: var(--aw-teal);
+  color: #07080c;
+  font-family: var(--font-body);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  border: none;
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease-standard),
+              box-shadow var(--dur-fast) var(--ease-standard),
+              transform var(--dur-fast) var(--ease-standard);
+  white-space: nowrap;
+}
+
+.aw-btn-primary:hover {
+  background: var(--aw-teal-hover);
+  box-shadow: 0 0 16px rgba(0, 194, 212, 0.3);
+}
+
+.aw-btn-primary:active {
+  transform: translateY(1px);
+}
+
+.aw-btn-primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  box-shadow: none;
+  transform: none;
+}
+
+.aw-btn-secondary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-radius: var(--r-md);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--aw-text-primary);
+  font-family: var(--font-body);
+  font-size: 0.8125rem;
+  font-weight: 500;
+  border: 1px solid var(--aw-border);
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease-standard),
+              border-color var(--dur-fast) var(--ease-standard);
+  white-space: nowrap;
+}
+
+.aw-btn-secondary:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: var(--aw-border-strong);
+}
+
+.aw-btn-secondary:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.aw-btn-ghost {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--aw-text-secondary);
+  font-family: var(--font-body);
+  font-size: 0.8125rem;
+  font-weight: 500;
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease-standard),
+              color var(--dur-fast) var(--ease-standard),
+              border-color var(--dur-fast) var(--ease-standard);
+  white-space: nowrap;
+}
+
+.aw-btn-ghost:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--aw-text-primary);
+  border-color: var(--aw-border-subtle);
+}
+
+.aw-btn-ghost:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ── Form Inputs ───────────────────────────────────────────────────────── */
+.aw-input {
+  width: 100%;
+  padding: 8px 12px;
+  background: var(--aw-surface-base);
+  border: 1px solid var(--aw-border);
+  border-radius: var(--r-md);
+  color: var(--aw-text-primary);
+  font-family: var(--font-body);
+  font-size: 0.875rem;
+  outline: none;
+  transition: border-color var(--dur-fast) var(--ease-standard),
+              box-shadow var(--dur-fast) var(--ease-standard);
+}
+
+.aw-input::placeholder {
+  color: var(--aw-coolgray-dim);
+}
+
+.aw-input:focus {
+  border-color: var(--aw-teal);
+  box-shadow: 0 0 0 1px rgba(0, 194, 212, 0.25);
+}
+
+.aw-form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 16px;
+}
+
+.aw-form-label {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--aw-coolgray);
+  letter-spacing: 0.02em;
+}
+
+/* ── Status Animations & Telemetry ─────────────────────────────────────── */
+@keyframes aw-breathe {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 1; }
+}
+
+.aw-breathe {
+  animation: aw-breathe 2.4s ease-in-out infinite;
+}
+
+@keyframes aw-pulse-amber {
+  0%, 100% { opacity: 0.6; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.08); }
+}
+
+.aw-pulse-amber {
+  animation: aw-pulse-amber 1.8s ease-in-out infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.analysis-spinner {
+  border: 2px solid rgba(255, 255, 255, 0.08);
+  border-top-color: var(--aw-teal);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+/* ── Scrollbars & Scroll Containment ───────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+  background: transparent;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: var(--r-full);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+/* Accessible focus ring */
+:focus-visible {
+  outline: 2px solid var(--aw-teal);
+  outline-offset: 2px;
+  border-radius: var(--r-sm);
+}
+
+/* Floor grid depth cue */
+.aw-floor-grid {
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.02) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
+  background-size: 40px 40px;
+}

@@ -1,0 +1,39 @@
+{
+  "name": "@ghost/web",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "tsc -p tsconfig.json && vite build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@react-three/drei": "^9.105.0",
+    "@react-three/fiber": "^8.16.0",
+    "@react-three/postprocessing": "^2.16.0",
+    "@supabase/supabase-js": "^2.110.8",
+    "@types/three": "^0.165.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "autoprefixer": "^10.5.4",
+    "clsx": "^2.1.1",
+    "framer-motion": "^13.1.1",
+    "framer-motion-3d": "^12.4.13",
+    "lucide-react": "^0.468.0",
+    "postcss": "^8.5.26",
+    "postprocessing": "^6.39.4",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^7.1.0",
+    "tailwind-merge": "^3.6.0",
+    "tailwindcss": "^3.4.19",
+    "three": "^0.165.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.2",
+    "@types/react-dom": "^19.0.2",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.5",
+    "vitest": "^4.1.10"
+  }
+}

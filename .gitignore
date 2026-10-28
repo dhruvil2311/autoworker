@@ -1,0 +1,151 @@
+# ──────────────────────────────────────────────────────────────
+# Top-level workspace gitignore protecting against accidental commits of secrets,
+# node_modules, build outputs, and local state from any nested directory.
+# ──────────────────────────────────────────────────────────────
+
+# ── Secrets & Environment Configurations ───────────────────────
+.env
+.env.*
+*.env
+**/.env
+**/.env.*
+*.local
+**/*.local
+!.env.example
+!**/.env.example
+!.env.template
+!**/.env.template
+
+# Private Keys, Certificates & Credential Stores
+*.pem
+*.key
+*.cert
+*.crt
+*.pfx
+*.p12
+*.keystore
+id_rsa*
+id_ed25519*
+.credentials
+credentials.json
+service-account*.json
+
+# ── Dependencies ──────────────────────────────────────────────
+node_modules/
+**/node_modules/
+.pnp/
+.pnp.js
+
+# ── Build & Compilation Outputs ───────────────────────────────
+dist/
+build/
+out/
+**/dist/
+**/build/
+**/out/
+.turbo/
+*.tsbuildinfo
+
+# ── Test Results, Reports & Coverage ──────────────────────────
+coverage/
+**/coverage/
+test-results/
+**/test-results/
+playwright-report/
+**/playwright-report/
+blob-report/
+**/blob-report/
+.nyc_output/
+
+# ── Runtime Output, Artifacts & Media Recordings ──────────────
+artifacts/
+**/artifacts/
+evidence_output/
+**/evidence_output/
+evidence_storage/
+**/evidence_storage/
+scratch_frames/
+**/scratch_frames/
+recordings/
+**/recordings/
+temp_output/
+**/temp_output/
+test_sample_out/
+**/test_sample_out/
+episodes.jsonl
+knowledge.jsonl
+ghost_transcript.json
+
+# Large media files (demonstration videos & raw screen captures)
+*.webm
+*.mp4
+*.mkv
+*.avi
+*.mov
+
+# ── Python Artifacts (Desktop Evidence Engine) ─────────────────
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+**/.pytest_cache/
+.mypy_cache/
+**/.mypy_cache/
+.ruff_cache/
+**/.ruff_cache/
+venv/
+.venv/
+env/
+ENV/
+*.egg-info/
+dist-py/
+build-py/
+
+# ── Logs & Debugging Output ────────────────────────────────────
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.eslintcache
+.vite/
+**/.vite/
+.cache/
+**/.cache/
+*.tmp
+*.temp
+
+# ── Supabase Local State ───────────────────────────────────────
+supabase/.branches/
+supabase/.temp/
+**/.branches/
+**/.temp/
+
+# ── Operating System Artifacts ─────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# ── IDE & Local Editor Configurations ──────────────────────────
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.sublime-*
+*.swp
+*.swo
+*~
+
+# ── AI Agents & Local Scratch Artifacts ────────────────────────
+.antigravity/
+**/.antigravity/
+.agents/
+**/.agents/
+.stitch/
+**/.stitch/
+diff.txt
+models.json

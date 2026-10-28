@@ -1,0 +1,19 @@
+[project]
+name = "ghost-desktop-evidence-engine"
+version = "0.1.0"
+description = "General Desktop Evidence Intelligence Layer for Ghost"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2.0.0",
+    "numpy>=1.24.0",
+    "opencv-python>=4.8.0",
+    "pillow>=9.5.0",
+]
+
+[project.scripts]
+ghost-evidence = "ghost_evidence.cli:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"

@@ -1,0 +1,50 @@
+{
+  "name": "ghost-retail-worker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Production-oriented baseline for Ghost Retail Worker record-to-automation SaaS.",
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:seed": "npx tsx scripts/seed-dev-user.ts",
+    "build:deps": "npm run build -w packages/workflow-schema -w packages/oir -w packages/security -w packages/shared-types -w packages/bpi -w packages/observability -w packages/runtime -w packages/university -w apps/api",
+    "predev": "node scripts/free-ports.js",
+    "dev": "npm run dev:seed && concurrently -k -n api,web,worker \"npm run dev:api\" \"npm run dev:web\" \"npm run dev:worker\"",
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "db:migrate": "supabase db push",
+    "dev:api": "npm run dev -w apps/api",
+    "dev:web": "npm run dev -w apps/web",
+    "dev:worker": "npm run dev -w apps/worker",
+    "dev:extension": "npm run build -w apps/extension",
+    "eval:e2e": "npx tsx evaluation/runner/index.ts",
+    "test:openrouter": "npx tsx scripts/test-openrouter.ts",
+    "demo:video-to-worker": "npx tsx scripts/demo-video-to-worker.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "concurrently": "^10.0.3",
+    "tsx": "4.23.13",
+    "typescript": "^5.7.2",
+    "vitest": "^4.1.10"
+  },
+  "engines": {
+    "node": ">=20.11"
+  },
+  "dependencies": {
+    "pg": "^8.23.0",
+    "puppeteer": "^25.3.0"
+  },
+  "overrides": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "framer-motion": "$framer-motion",
+    "@react-three/fiber": "^8.16.0",
+    "three": "0.165.0"
+  }
+}

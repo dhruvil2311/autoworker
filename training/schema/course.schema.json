@@ -1,0 +1,32 @@
+﻿{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "title": { "type": "string" },
+    "domain": { "type": "string" },
+    "difficulty": { "type": "string", "enum": ["Small", "Medium", "Large"] },
+    "lessons": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "title": { "type": "string" },
+          "focus": { "type": "string" },
+          "passing_score": { "type": "number", "minimum": 0, "maximum": 1 }
+        },
+        "required": ["id", "title", "focus", "passing_score"]
+      }
+    },
+    "graduation_criteria": {
+      "type": "object",
+      "properties": {
+        "min_average_score": { "type": "number", "minimum": 0, "maximum": 1 },
+        "must_pass_all_lessons": { "type": "boolean" },
+        "max_repeat_mistakes": { "type": "number", "minimum": 0 }
+      },
+      "required": ["min_average_score", "must_pass_all_lessons", "max_repeat_mistakes"]
+    }
+  },
+  "required": ["title", "domain", "difficulty", "lessons", "graduation_criteria"]
+}

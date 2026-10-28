@@ -1,0 +1,25 @@
+{
+  "name": "@ghost/runtime",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@browserbasehq/sdk": "^2.16.0",
+    "@ghost/desktop-agent": "0.1.0",
+    "@ghost/shared-types": "0.1.0",
+    "@ghost/workflow-schema": "0.1.0",
+    "@modelcontextprotocol/sdk": "^1.0.1",
+    "csv-parse": "^7.0.2",
+    "playwright": "^1.62.1",
+    "xlsx": "^0.18.5",
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.3"
+  }
+}

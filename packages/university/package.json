@@ -1,0 +1,23 @@
+{
+  "name": "@ghost/university",
+  "version": "1.0.0",
+  "private": true,
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run src/kes.test.ts",
+    "clean": "rimraf dist"
+  },
+  "dependencies": {
+    "@ghost/runtime": "*",
+    "@ghost/workflow-schema": "*",
+    "@ghost/observability": "*",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "vitest": "^4.1.10",
+    "rimraf": "^5.0.0"
+  }
+}

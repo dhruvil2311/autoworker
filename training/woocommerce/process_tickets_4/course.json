@@ -1,0 +1,54 @@
+{
+  "title": "Process Tickets 4",
+  "domain": "woocommerce",
+  "difficulty": "Medium",
+  "lessons": [
+    {
+      "id": "lesson_1",
+      "title": "Learn variables",
+      "focus": "Variable Extraction",
+      "passing_score": 0.95
+    },
+    {
+      "id": "lesson_2",
+      "title": "Learn business rules",
+      "focus": "Business Rules",
+      "passing_score": 0.95
+    },
+    {
+      "id": "lesson_3",
+      "title": "Learn loops",
+      "focus": "Iteration",
+      "passing_score": 0.95
+    },
+    {
+      "id": "lesson_4",
+      "title": "Clarification",
+      "focus": "Merchant Clarification",
+      "passing_score": 0.95
+    },
+    {
+      "id": "lesson_5",
+      "title": "Execution",
+      "focus": "Pipeline Execution",
+      "passing_score": 0.95
+    },
+    {
+      "id": "lesson_6",
+      "title": "Recover from failure",
+      "focus": "HITL Recovery",
+      "passing_score": 0.95
+    },
+    {
+      "id": "lesson_7",
+      "title": "Learn after correction",
+      "focus": "Knowledge Evolution",
+      "passing_score": 0.95
+    }
+  ],
+  "graduation_criteria": {
+    "min_average_score": 0.95,
+    "must_pass_all_lessons": true,
+    "max_repeat_mistakes": 0
+  }
+}

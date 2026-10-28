@@ -1,0 +1,147 @@
+{
+  "id": "step_1",
+  "operation": "SEQUENCE",
+  "target": "BROWSER_SEMANTIC",
+  "description": "Establishing Order Management Protocols",
+  "args": {},
+  "children": [
+    {
+      "id": "step_2",
+      "operation": "EXTRACT",
+      "target": "BROWSER_SEMANTIC",
+      "description": "Extract order status",
+      "args": {
+        "instruction": "Extract the order status from the page"
+      },
+      "bind_result_to": "var_0",
+      "children": []
+    },
+    {
+      "id": "step_3",
+      "operation": "IF",
+      "target": "DATA",
+      "description": "Check if order status is PROCESSING",
+      "args": {
+        "condition": "EQUALS",
+        "left": "{{var_0}}",
+        "right": "PROCESSING"
+      },
+      "children": [
+        {
+          "id": "step_4",
+          "operation": "CLICK",
+          "target": "BROWSER_SEMANTIC",
+          "description": "Click 'Mark Checked'",
+          "args": {
+            "selector": "button#mark-checked"
+          },
+          "children": []
+        }
+      ]
+    },
+    {
+      "id": "step_5",
+      "operation": "IF",
+      "target": "DATA",
+      "description": "Check if order status is DELAYED",
+      "args": {
+        "condition": "EQUALS",
+        "left": "{{var_0}}",
+        "right": "DELAYED"
+      },
+      "children": [
+        {
+          "id": "step_6",
+          "operation": "EXTRACT",
+          "target": "BROWSER_SEMANTIC",
+          "description": "Extract Days Delayed",
+          "args": {
+            "instruction": "Extract the number of days delayed from the page"
+          },
+          "bind_result_to": "var_1",
+          "children": []
+        },
+        {
+          "id": "step_7",
+          "operation": "IF",
+          "target": "DATA",
+          "description": "Check if Days Delayed is <= 7",
+          "args": {
+            "condition": "LESS_THAN_EQUALS",
+            "left": "{{var_1}}",
+            "right": "7"
+          },
+          "children": [
+            {
+              "id": "step_8",
+              "operation": "CLICK",
+              "target": "BROWSER_SEMANTIC",
+              "description": "Click 'Notify Operator'",
+              "args": {
+                "selector": "button#notify-operator"
+              },
+              "children": []
+            }
+          ]
+        },
+        {
+          "id": "step_9",
+          "operation": "IF",
+          "target": "DATA",
+          "description": "Check if Days Delayed is > 7",
+          "args": {
+            "condition": "GREATER_THAN",
+            "left": "{{var_1}}",
+            "right": "7"
+          },
+          "children": [
+            {
+              "id": "step_10",
+              "operation": "CLICK",
+              "target": "BROWSER_SEMANTIC",
+              "description": "Click 'Escalate to Manager'",
+              "args": {
+                "selector": "button#escalate-manager"
+              },
+              "children": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "step_11",
+      "operation": "IF",
+      "target": "DATA",
+      "description": "Check if order status is missing or ambiguous",
+      "args": {
+        "condition": "NOT_EQUALS",
+        "left": "{{var_0}}",
+        "right": "PROCESSING"
+      },
+      "children": [
+        {
+          "id": "step_12",
+          "operation": "IF",
+          "target": "DATA",
+          "description": "Check if order status is DELAYED",
+          "args": {
+            "condition": "NOT_EQUALS",
+            "left": "{{var_0}}",
+            "right": "DELAYED"
+          },
+          "children": [
+            {
+              "id": "step_13",
+              "operation": "REQUIRE_APPROVAL",
+              "target": "DATA",
+              "description": "Ask a human for help",
+              "args": {},
+              "children": []
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

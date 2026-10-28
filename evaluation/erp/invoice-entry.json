@@ -1,0 +1,47 @@
+{
+  "id": "erp-inv-1",
+  "businessDescription": "Simulated retail operation",
+  "industry": "erp",
+  "goal": "Invoice Entry",
+  "sop": "Standard Operating Procedure document mock",
+  "csv": [
+    {
+      "item": "123",
+      "qty": "1"
+    }
+  ],
+  "apiMetadata": {},
+  "browserDemonstrations": [
+    {
+      "id": "demo-1",
+      "url": "https://example.com/demo1",
+      "events": [
+        {
+          "type": "click",
+          "selector": "#btn"
+        }
+      ],
+      "intentionalObstacle": "Missing CSV values"
+    }
+  ],
+  "merchantClarificationAnswers": {
+    "question_1": "Standard answer"
+  },
+  "expectedBusinessProcessSpecification": {
+    "steps": [
+      "Step 1",
+      "Step 2"
+    ]
+  },
+  "expectedExecutionPlan": {
+    "actions": [
+      "click",
+      "type"
+    ]
+  },
+  "expectedRuntimeBehaviour": [
+    "Navigate to correct page",
+    "Handle exception if Missing CSV values"
+  ],
+  "expectedLearningAfterCorrection": "Ghost updates BPS to handle Missing CSV values"
+}
