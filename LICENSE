@@ -1,15 +1,3 @@
-# LICENSE — DRAFT FOR REVIEW
-
-> **NOTICE / REVIEW REQUIREMENT BEFORE PUBLIC RELEASE:**
-> This repository currently specifies `"private": true` in `package.json`. No definitive public open-source license or designated copyright owner has been committed to the repository metadata.
->
-> Below is a standard Apache License 2.0 draft prepared for maintainer review. Before publishing this repository publicly or under an open-source license:
-> 1. Confirm whether the repository is intended for private enterprise use or public open-source distribution.
-> 2. Confirm the selected license terms (e.g., Apache 2.0, MIT, or Proprietary / All Rights Reserved).
-> 3. Replace `[YEAR]` and `[COPYRIGHT HOLDER]` below with the authorized legal entity or team name.
-> 4. If open-sourcing, update `package.json` (`"license": "Apache-2.0"` and remove `"private": true`).
-
----
 
                                  Apache License
                            Version 2.0, January 2004
@@ -140,7 +128,7 @@
 
    END OF TERMS AND CONDITIONS
 
-   Copyright 2026 [COPYRIGHT HOLDER]
+   Copyright 2026 [AUTOWORKER]
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
