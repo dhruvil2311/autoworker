@@ -104,48 +104,15 @@ export class OutputExecutor implements ExecutionCapability {
       });
     }
 
-    // If no explicit variables extracted yet, populate from browser context or page metadata
-    if (observations.length === 0) {
-      const bCtx = (context as any).getBrowserContext?.() || {};
-      const fallbackUrl = allRuntimeOutputs.sourceUrl || bCtx.currentUrl || state.inputs?.targetUrl || state.inputs?.url || "https://www.amazon.com/s?k=ergonomic+mouse";
-      const fallbackTitle = allRuntimeOutputs.pageTitle || bCtx.title || "Amazon.com : ergonomic mouse";
-      const fallbackItems = allRuntimeOutputs.products || [
-        {
-          title: "Anker 2.4G Wireless Vertical Ergonomic Optical Mouse",
-          price: "$19.99",
-          rating: "4.4 out of 5 stars"
-        },
-        {
-          title: "Logitech MX Master 3S Advanced Wireless Mouse",
-          price: "$99.99",
-          rating: "4.7 out of 5 stars"
-        }
-      ];
-
-      observations.push(
-        { key: "page_title", value: fallbackTitle, raw_value: fallbackTitle, language: "en", translated: false },
-        { key: "verified_url", value: fallbackUrl, raw_value: fallbackUrl, language: "en", translated: false },
-        { key: "products", value: fallbackItems, raw_value: fallbackItems, language: "en", translated: false },
-        { key: "top_product", value: fallbackItems[0]?.title || "Vertical Ergonomic Mouse", raw_value: fallbackItems[0]?.title || "Vertical Ergonomic Mouse", language: "en", translated: false },
-        { key: "observed_price", value: fallbackItems[0]?.price || "$19.99", raw_value: fallbackItems[0]?.price || "$19.99", language: "en", translated: false }
-      );
-
-      evidenceList.push(
-        { label: "page_title", value: fallbackTitle, source_url: fallbackUrl, selector: "title", step_id: "browser_action", timestamp: new Date().toISOString() },
-        { label: "verified_url", value: fallbackUrl, source_url: fallbackUrl, selector: "window.location", step_id: "browser_action", timestamp: new Date().toISOString() },
-        { label: "top_product", value: fallbackItems[0]?.title || "Vertical Ergonomic Mouse", source_url: fallbackUrl, selector: "div[data-component-type='s-search-result']", step_id: "browser_action", timestamp: new Date().toISOString() },
-        { label: "observed_price", value: fallbackItems[0]?.price || "$19.99", source_url: fallbackUrl, selector: ".a-price", step_id: "browser_action", timestamp: new Date().toISOString() }
-      );
-    }
-
+    // Nothing observed means nothing to report: the deliverable is built from runtime evidence only.
     // 2. Synthesize output based on output_type(s)
     const typesToBuild: OutputType[] = contract.output_types && contract.output_types.length > 0
       ? contract.output_types
       : [contract.output_type];
 
     const builtOutputs: Record<string, any> = {};
-    let allEvidenceValid = true;
-    const missingEvidence: string[] = [];
+    let allEvidenceValid = observations.length > 0;
+    const missingEvidence: string[] = observations.length > 0 ? [] : ["No observations were captured during execution."];
 
     for (const outType of typesToBuild) {
       switch (outType) {
@@ -179,6 +146,10 @@ export class OutputExecutor implements ExecutionCapability {
         case "CLASSIFICATION": {
           const classResult = this.synthesizeClassification(observations, contract, step.args);
           builtOutputs.classification = classResult;
+          if (classResult.status === "INCOMPLETE") {
+            allEvidenceValid = false;
+            missingEvidence.push(classResult.incomplete_reason);
+          }
           break;
         }
         case "SUMMARY": {
@@ -190,11 +161,19 @@ export class OutputExecutor implements ExecutionCapability {
         case "DECISION": {
           const recResult = this.synthesizeRecommendation(observations, contract, step.args);
           builtOutputs.recommendation = recResult;
+          if (recResult.status === "INCOMPLETE") {
+            allEvidenceValid = false;
+            missingEvidence.push(recResult.incomplete_reason);
+          }
           break;
         }
         case "GENERATED_TEXT": {
           const genResult = this.synthesizeGeneratedText(observations, contract, step.args);
           builtOutputs.generated_text = genResult;
+          if (genResult.status === "INCOMPLETE") {
+            allEvidenceValid = false;
+            missingEvidence.push(genResult.incomplete_reason);
+          }
           break;
         }
         case "GENERATED_FILE":
@@ -594,22 +573,20 @@ export class OutputExecutor implements ExecutionCapability {
   }
 
   private synthesizeRecommendation(observations: any[], contract: OutputContract, args: any): any {
+    // A recommendation needs a decision rule from the workflow; none is invented here.
+    const rule = typeof args?.decision_rule === "string" ? args.decision_rule : undefined;
     const entities = this.extractEntitiesFromObservations(observations);
-    const recommendations = entities.map((ent) => {
-      const totalNum = ent.total ? (this.extractNumber(ent.total) || 0) : 0;
+    if (!rule || entities.length === 0) {
       return {
-        target: ent.name,
-        priority: totalNum > 1500 ? "HIGH" : "MEDIUM",
-        action: "Approve for expedited fulfillment",
-        rationale: `Verified order details for ${ent.customer || ent.name} with status ${ent.status || "Complete"}.`
+        status: "INCOMPLETE",
+        incomplete_reason: !rule ? "No decision rule was demonstrated or specified for a recommendation." : "No records were observed to base a recommendation on.",
+        observed_records: entities.map(e => e.name)
       };
-    });
-
+    }
     return {
       status: "COMPLETE",
-      recommendations: recommendations.length > 0 ? recommendations : [
-        { target: "All Records", priority: "MEDIUM", action: "Proceed with standard processing", rationale: "No critical flags observed." }
-      ]
+      decision_rule: rule,
+      records: entities.map(ent => ({ target: ent.name, status: ent.status, total: ent.total }))
     };
   }
 
@@ -621,13 +598,10 @@ export class OutputExecutor implements ExecutionCapability {
       body: `Dear ${ent.customer || "Customer"},\n\nWe are writing to confirm that your order ${ent.name}${ent.total ? ` with total of ${ent.total}` : ""}${ent.status ? ` is currently ${ent.status}` : ""}.\n\nThank you!`
     }));
 
-    return {
-      status: "COMPLETE",
-      messages: messages.length > 0 ? messages : [{
-        subject: "Process Notification",
-        body: `Processed observation items successfully.`
-      }]
-    };
+    if (messages.length === 0) {
+      return { status: "INCOMPLETE", incomplete_reason: "No records were observed to write messages about.", messages: [] };
+    }
+    return { status: "COMPLETE", messages };
   }
 
   private synthesizeReport(observations: any[], contract: OutputContract, args: any): any {

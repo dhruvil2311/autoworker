@@ -1,7 +1,10 @@
 import { Router, type Request, type Response } from "express";
 import * as path from "path";
 import * as fs from "fs";
-import { AppStore } from "../store.js";
+import { createHash } from "crypto";
+import type { AuthContext } from "@ghost/shared-types";
+import { assessExecutionReadiness, type ReadinessReport } from "@ghost/workflow-schema";
+import { AppStore, type DocumentRow } from "../store.js";
 import { logger } from "@ghost/observability";
 import { DesktopEvidenceBridge } from "../services/desktop-evidence-bridge.js";
 import { BusinessProcessIntelligence } from "@ghost/bpi";
@@ -9,11 +12,13 @@ import { RealSemanticBPIProvider } from "../ai-provider.js";
 import { WorkflowCompiler } from "../compiler.js";
 import type { ApiConfig } from "../config.js";
 import { purgeOrRecompileWorkerAfterDocDeletion } from "../services/doc-purge.js";
-import { EvidenceToWorkflowPipeline } from "../services/evidence/evidence-pipeline.js";
+import { EvidenceToWorkflowPipeline, PrecomputedSemanticBPIProvider, type PipelineExecutionResult } from "../services/evidence/evidence-pipeline.js";
+import { OpenRouterQuotaManager } from "../services/openrouter/quota-manager.js";
 import type { RawVisualObservation } from "../services/evidence/task-relevance-engine.js";
+import type { OcrFact } from "../services/openrouter/types.js";
 
-const asyncHandler = (fn: (req: Request, res: Response) => Promise<any>) => 
-  (req: Request, res: Response, next: any) => 
+const asyncHandler = (fn: (req: Request, res: Response) => Promise<any>) =>
+  (req: Request, res: Response, next: any) =>
     Promise.resolve(fn(req, res)).catch(next);
 
 const param = (req: Request, name: string): string => {
@@ -29,13 +34,13 @@ const param = (req: Request, name: string): string => {
 export function formatHumanReadableUncertainty(u: any, idx: number = 0): any {
   let q = (u.clarification_question || u.suggested_clarification_question || u.question || u.description || "").trim();
   const rawId = (u.id || u.uncertainty_type || "").toLowerCase();
-  const isIdLike = !q || 
-                   q.startsWith("unc_") || 
-                   q.startsWith("gap_") || 
-                   !q.includes(" ") || 
-                   /^[a-z0-9_-]+$/i.test(q) || 
-                   /\b(?:msg|message|id|code|err|error)[_\s-]*\d{3,}\b/i.test(q) || 
-                   /^message\s*id\b/i.test(q) || 
+  const isIdLike = !q ||
+                   q.startsWith("unc_") ||
+                   q.startsWith("gap_") ||
+                   !q.includes(" ") ||
+                   /^[a-z0-9_-]+$/i.test(q) ||
+                   /\b(?:msg|message|id|code|err|error)[_\s-]*\d{3,}\b/i.test(q) ||
+                   /^message\s*id\b/i.test(q) ||
                    /^\d+$/.test(q);
 
   if (isIdLike) {
@@ -69,56 +74,160 @@ export function formatHumanReadableUncertainty(u: any, idx: number = 0): any {
   };
 }
 
+/** Magic-byte checks: the stored file must really be the media type its name claims. */
+const MEDIA_SIGNATURES: Array<{ type: "VIDEO" | "IMAGE"; extensions: string[]; matches: (b: Buffer) => boolean }> = [
+  { type: "VIDEO", extensions: [".webm", ".mkv"], matches: b => b.length > 4 && b[0] === 0x1a && b[1] === 0x45 && b[2] === 0xdf && b[3] === 0xa3 },
+  { type: "VIDEO", extensions: [".mp4", ".mov", ".m4v"], matches: b => b.length > 12 && b.subarray(4, 8).toString("ascii") === "ftyp" },
+  { type: "VIDEO", extensions: [".avi"], matches: b => b.length > 12 && b.subarray(0, 4).toString("ascii") === "RIFF" && b.subarray(8, 12).toString("ascii") === "AVI " },
+  { type: "IMAGE", extensions: [".png"], matches: b => b.length > 8 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47 },
+  { type: "IMAGE", extensions: [".jpg", ".jpeg"], matches: b => b.length > 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff },
+  { type: "IMAGE", extensions: [".webp"], matches: b => b.length > 12 && b.subarray(0, 4).toString("ascii") === "RIFF" && b.subarray(8, 12).toString("ascii") === "WEBP" }
+];
+
+export function detectMediaType(name: string, bytes: Buffer): "VIDEO" | "IMAGE" | "DESKTOP_RECORDING" | undefined {
+  const ext = path.extname(name).toLowerCase();
+  if (ext === ".json") {
+    try { JSON.parse(bytes.toString("utf8")); return "DESKTOP_RECORDING"; } catch { return undefined; }
+  }
+  const signature = MEDIA_SIGNATURES.find(s => s.extensions.includes(ext));
+  return signature && signature.matches(bytes) ? signature.type : undefined;
+}
+
+export function sha256(bytes: Buffer): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function storageDir(tenantId: string, workerId: string): string {
+  return path.resolve("./evidence_storage", tenantId, workerId);
+}
+
+/** True when the path resolves inside this tenant's and worker's evidence storage. */
+function isInsideStorage(candidate: string, tenantId: string, workerId: string): boolean {
+  const root = storageDir(tenantId, workerId) + path.sep;
+  return path.resolve(candidate).startsWith(root);
+}
+
+type ResolvedMedia = { doc?: DocumentRow; filePath: string; contentSha256: string };
+
+/**
+ * Resolves the media an analysis or compilation refers to. Only this worker's uploaded documents
+ * (or files inside its own storage directory) can be analysed; arbitrary server paths are refused.
+ */
+async function resolveWorkerMedia(store: AppStore, auth: AuthContext, workerId: string, body: any): Promise<ResolvedMedia | { error: string; status: number }> {
+  const docId = body.documentId || body.assetId;
+  if (docId) {
+    const doc = await store.getDocument(auth, docId);
+    if (!doc || (doc.workerId && doc.workerId !== workerId)) return { error: "Evidence document not found for this worker", status: 404 };
+    const filePath = (doc.parsedJson as any)?.filePath;
+    if (!filePath || !fs.existsSync(filePath)) return { error: "The uploaded evidence file is missing from storage", status: 410 };
+    const contentSha256 = (doc.parsedJson as any)?.sha256 || sha256(fs.readFileSync(filePath));
+    return { doc, filePath, contentSha256 };
+  }
+  const legacyPath = body.filePath || body.videoPath;
+  if (legacyPath) {
+    if (!isInsideStorage(legacyPath, auth.tenantId, workerId) || !fs.existsSync(legacyPath)) {
+      return { error: "Evidence must be referenced by its uploaded document id", status: 400 };
+    }
+    return { filePath: path.resolve(legacyPath), contentSha256: sha256(fs.readFileSync(legacyPath)) };
+  }
+  return { error: "Evidence file not found: no document specified", status: 400 };
+}
+
 export function createEvidenceRouter(config: ApiConfig, store: AppStore): Router {
   const router = Router({ mergeParams: true });
   const bridge = DesktopEvidenceBridge.getInstance();
   const aiProvider = new RealSemanticBPIProvider(config);
 
+  /**
+   * Persists a compiled workflow version and, only if it is executable, makes it the worker's active
+   * version. In-flight runs of the replaced version are cancelled (their history is kept).
+   */
+  async function persistAndBind(auth: AuthContext, workerId: string, workflow: any, trainingSource: Record<string, unknown>, bpsId?: string) {
+    const readiness: ReadinessReport = assessExecutionReadiness(workflow);
+    (workflow.compiler as any).readiness = readiness;
+    (workflow.compiler as any).worker_id = workerId;
+    const version = await store.createWorkflowVersion(auth, workflow);
+    if (!readiness.executable) {
+      return { version, readiness, bound: false };
+    }
+    await store.supersedeWorkerRuns(auth, workerId, `Workflow replaced by version ${version.id}`);
+    const currentWorker = await store.getGhostWorker(auth, workerId);
+    const source = { ...trainingSource, workflowVersionId: version.id, compiledAt: new Date().toISOString() };
+    await store.updateGhostWorker(auth, workerId, {
+      workflowId: version.workflowId,
+      activeVersionId: version.id,
+      ...(bpsId ? { bpsId } : {}),
+      status: "READY_FOR_REVIEW",
+      trainingSource: source,
+      triggerConfig: { ...(currentWorker?.triggerConfig || {}), trainingSource: source }
+    } as any);
+    return { version, readiness, bound: true };
+  }
+
+  function notExecutableResponse(res: Response, jobId: string, versionId: string, readiness: ReadinessReport, extra: Record<string, unknown> = {}) {
+    return res.status(422).json({
+      success: false,
+      status: "NEEDS_CLARIFICATION",
+      error: "A workflow was reconstructed but it is not safe to run yet. It was saved as a draft and not activated.",
+      jobId,
+      draftWorkflowVersionId: versionId,
+      readiness: readiness.issues,
+      ...extra
+    });
+  }
+
   // 1. Upload Video or Screenshot Evidence
   router.post("/upload", asyncHandler(async (req, res) => {
     const auth = req.auth!;
     const workerId = param(req, "id");
-    const { name, content, type } = req.body;
+    const { name, content } = req.body;
 
-    if (!name || !content) {
+    if (!name || !content || typeof content !== "string") {
       return res.status(400).json({ error: "Missing name or content" });
     }
 
-    // Check if worker already has a document with this exact filename
+    const bytes = content.startsWith("data:")
+      ? Buffer.from(content.split(";base64,").pop() || "", "base64")
+      : Buffer.from(content, "utf-8");
+    if (!bytes.length) {
+      return res.status(400).json({ error: "The uploaded file is empty", code: "EMPTY_UPLOAD" });
+    }
+    const mediaType = detectMediaType(name, bytes);
+    if (!mediaType) {
+      return res.status(415).json({ error: `"${path.basename(name)}" is not a supported, decodable video or image (webm, mkv, mp4, mov, avi, png, jpg, webp).`, code: "UNSUPPORTED_MEDIA" });
+    }
+    const contentSha256 = sha256(bytes);
+
+    // Identity is the content, not the file name: the same bytes are reused, a different
+    // recording with the same name is stored and analysed as a new upload.
     const existingDocs = await store.listDocuments(auth, workerId);
-    const duplicate = existingDocs.find(d => d.name === name);
-    if (duplicate && (duplicate.parsedJson as any)?.filePath && fs.existsSync((duplicate.parsedJson as any).filePath)) {
-      logger.info({ workerId, name, docId: duplicate.id }, "Reusing existing evidence document");
+    const duplicate = existingDocs.find(d => (d.parsedJson as any)?.sha256 === contentSha256 && fs.existsSync((d.parsedJson as any)?.filePath || ""));
+    if (duplicate) {
+      logger.info({ workerId, docId: duplicate.id }, "Upload has identical content to an existing evidence document");
       return res.status(200).json({
         document: duplicate,
         asset: { id: duplicate.id, name: duplicate.name },
         filePath: (duplicate.parsedJson as any).filePath,
         mediaId: duplicate.id,
+        duplicateOf: duplicate.id
       });
     }
 
-    const uploadsDir = path.resolve("./evidence_storage", auth.tenantId, workerId);
+    const uploadsDir = storageDir(auth.tenantId, workerId);
     fs.mkdirSync(uploadsDir, { recursive: true });
-
-    const safeName = `${Date.now()}_${path.basename(name)}`;
+    const safeName = `${Date.now()}_${contentSha256.slice(0, 12)}_${path.basename(name).replace(/[^\w.\-]+/g, "_")}`;
     const targetFilePath = path.join(uploadsDir, safeName);
+    fs.writeFileSync(targetFilePath, bytes);
 
-    // Save content (base64 or text)
-    if (content.startsWith("data:")) {
-      const base64Data = content.split(";base64,").pop();
-      fs.writeFileSync(targetFilePath, Buffer.from(base64Data, "base64"));
-    } else {
-      fs.writeFileSync(targetFilePath, content, "utf-8");
-    }
-
-    // Save reference in worker_documents store
     const doc = await store.createDocument(auth, {
       workerId,
-      type: type || (name.match(/\.(mp4|webm|mov|mkv)$/i) ? "VIDEO" : "IMAGE"),
+      type: mediaType,
       name,
       parsedJson: {
         filePath: targetFilePath,
         fileName: safeName,
+        sha256: contentSha256,
+        sizeBytes: bytes.length,
         uploadedAt: new Date().toISOString(),
       },
     });
@@ -134,17 +243,9 @@ export function createEvidenceRouter(config: ApiConfig, store: AppStore): Router
   // List past media evidence and jobs for worker
   router.get("/", asyncHandler(async (req, res) => {
     const auth = req.auth!;
-    const targetId = param(req, "id");
-    let resolvedId = targetId;
-    try {
-      let worker = await store.getGhostWorker(auth, targetId);
-      if (!worker) {
-        const all = await store.listGhostWorkers(auth);
-        worker = all.find(w => w.id === targetId || (w as any).allIds?.includes(targetId)) ||
-                 all.find(w => w.name && w.name.trim().toLowerCase() === targetId.trim().toLowerCase());
-      }
-      if (worker) resolvedId = worker.id;
-    } catch (_) {}
+    const workerId = param(req, "id");
+    const worker = await store.getGhostWorker(auth, workerId).catch(() => undefined);
+    const resolvedId = worker?.id || workerId;
 
     try {
       const [evidence, docs] = await Promise.all([
@@ -152,10 +253,10 @@ export function createEvidenceRouter(config: ApiConfig, store: AppStore): Router
         store.listDocuments(auth, resolvedId).catch(() => [])
       ]);
 
-      const mediaDocs = docs.filter(d => 
-        (d.type as string) === 'VIDEO' || 
-        (d.type as string) === 'IMAGE' || 
-        (d.type as string) === 'DESKTOP_RECORDING' || 
+      const mediaDocs = docs.filter(d =>
+        (d.type as string) === 'VIDEO' ||
+        (d.type as string) === 'IMAGE' ||
+        (d.type as string) === 'DESKTOP_RECORDING' ||
         Boolean(d.name?.match(/\.(mp4|webm|mov|mkv|avi|png|jpg)$/i))
       );
 
@@ -166,11 +267,7 @@ export function createEvidenceRouter(config: ApiConfig, store: AppStore): Router
       });
     } catch (err: any) {
       logger.warn({ err: err?.message, workerId: resolvedId }, "Failed to fetch full worker evidence");
-      return res.json({
-        evidence: { documents: [], runs: [] },
-        documents: [],
-        allDocuments: []
-      });
+      return res.status(503).json({ error: "Evidence could not be loaded", evidence: { documents: [], runs: [] }, documents: [], allDocuments: [] });
     }
   }));
 
@@ -178,50 +275,36 @@ export function createEvidenceRouter(config: ApiConfig, store: AppStore): Router
   router.post("/analyze", asyncHandler(async (req, res) => {
     const auth = req.auth!;
     const workerId = param(req, "id");
-    const { filePath, documentId, assetId, videoPath } = req.body;
-
-    let targetPath = filePath || videoPath;
-    const docId = documentId || assetId;
-    if (!targetPath && docId) {
-      const doc = await store.getDocument(auth, docId);
-      targetPath = (doc?.parsedJson as any)?.filePath;
+    const media = await resolveWorkerMedia(store, auth, workerId, req.body || {});
+    if ("error" in media) {
+      return res.status(media.status).json({ error: media.error });
     }
 
-    if (!targetPath || !fs.existsSync(targetPath)) {
-      return res.status(400).json({ error: `Evidence file not found: ${targetPath || 'no path specified'}` });
-    }
-
-    // Check if an existing completed job already exists for this media file
-    const existingJobId = bridge.findJobIdForMedia(targetPath);
-    if (existingJobId) {
-      const existingJob = bridge.getJob(existingJobId);
-      if (existingJob && (existingJob.status === "COMPLETED" || existingJob.status === "RUNNING")) {
-        logger.info({ jobId: existingJobId, targetPath }, "Reusing already analyzed evidence job");
-        return res.status(200).json({
-          jobId: existingJob.jobId,
-          job: {
-            id: existingJob.jobId,
-            status: existingJob.status,
-            currentStage: existingJob.currentStage,
-            progressPercent: existingJob.progressPercent,
-            result: existingJob.result,
-          },
-          status: existingJob.status,
-          currentStage: existingJob.currentStage,
-          progressPercent: existingJob.progressPercent,
-        });
-      }
+    const reusable = !req.body?.forceReanalyze && bridge.findCompletedJobForContent(media.contentSha256, auth.tenantId, workerId);
+    const inFlight = bridge.listJobs().find(j => j.contentSha256 === media.contentSha256 && j.tenantId === auth.tenantId && j.workerId === workerId && ["QUEUED", "RUNNING", "EXTRACTING"].includes(j.status));
+    const existingJob = reusable || inFlight;
+    if (existingJob) {
+      logger.info({ jobId: existingJob.jobId }, "Reusing analysis of identical content for this worker");
+      return res.status(200).json({
+        jobId: existingJob.jobId,
+        job: { id: existingJob.jobId, status: existingJob.status, currentStage: existingJob.currentStage, progressPercent: existingJob.progressPercent, result: existingJob.result },
+        status: existingJob.status,
+        currentStage: existingJob.currentStage,
+        progressPercent: existingJob.progressPercent,
+        reused: true
+      });
     }
 
     const jobId = `job_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
     const outputDir = path.resolve("./evidence_output", auth.tenantId, workerId);
-
     const job = await bridge.analyzeMedia({
       jobId,
-      mediaPath: targetPath,
+      mediaPath: media.filePath,
       outputDir,
       tenantId: auth.tenantId,
       workerId,
+      ...(media.doc ? { documentId: media.doc.id } : {}),
+      contentSha256: media.contentSha256
     });
 
     res.status(202).json({
@@ -233,10 +316,15 @@ export function createEvidenceRouter(config: ApiConfig, store: AppStore): Router
     });
   }));
 
+  const workerJob = (req: Request) => {
+    const job = bridge.getJob(param(req, "jobId"), req.auth!.tenantId);
+    const workerId = param(req, "id");
+    return job && (!job.workerId || job.workerId === workerId) ? job : undefined;
+  };
+
   // 3. Poll Analysis Job Status
   router.get("/jobs/:jobId", asyncHandler(async (req, res) => {
-    const jobId = param(req, "jobId");
-    const job = bridge.getJob(jobId);
+    const job = workerJob(req);
     if (!job) {
       return res.status(404).json({ error: "Job not found" });
     }
@@ -245,8 +333,7 @@ export function createEvidenceRouter(config: ApiConfig, store: AppStore): Router
 
   // 4. Retrieve Reconstructed Timeline
   router.get("/jobs/:jobId/timeline", asyncHandler(async (req, res) => {
-    const jobId = param(req, "jobId");
-    const job = bridge.getJob(jobId);
+    const job = workerJob(req);
     if (!job || !job.result) {
       return res.status(404).json({ error: "Job timeline not ready or job not found" });
     }
@@ -254,13 +341,30 @@ export function createEvidenceRouter(config: ApiConfig, store: AppStore): Router
       timeline: job.result.timeline,
       processUnderstanding: job.result.process_understanding,
       semanticActions: job.result.semantic_actions,
+      droppedActions: job.result.dropped_actions || [],
       frames: job.result.frames,
       uncertainties: (job.result.uncertainties || []).map((u: any, i: number) => formatHumanReadableUncertainty(u, i)),
       compiledWorkflow: job.result.compiledWorkflow || null,
       compiledWorkflowVersionId: job.result.compiledWorkflowVersionId || null,
+      grounding: job.result.grounding || null,
       specification: job.result.specification || null,
       bpsId: job.result.bpsId || null,
     });
+  }));
+
+  // 4.5 Serve one extracted frame of this worker's analysis job (tenant- and worker-scoped).
+  router.get("/jobs/:jobId/frames/:frameId", asyncHandler(async (req, res) => {
+    const job = workerJob(req);
+    const frameId = param(req, "frameId");
+    const frame = (job?.result?.frames || []).find((f: any) => f.frame_id === frameId);
+    const filePath = frame?.image_path || frame?.thumbnail_path;
+    const allowedRoot = job?.outputDir ? path.resolve(job.outputDir) + path.sep : undefined;
+    if (!job || !filePath || !allowedRoot || !path.resolve(filePath).startsWith(allowedRoot) || !fs.existsSync(filePath)) {
+      return res.status(404).json({ error: "Frame not found" });
+    }
+    res.setHeader("Cache-Control", "private, max-age=300");
+    res.type(path.extname(filePath) || ".jpg");
+    fs.createReadStream(filePath).pipe(res);
   }));
 
   // 5. Compile Analyzed Demonstration directly into BPS and Workflow V2
@@ -268,168 +372,203 @@ export function createEvidenceRouter(config: ApiConfig, store: AppStore): Router
     const auth = req.auth!;
     const workerId = param(req, "id");
     const jobId = param(req, "jobId");
+    const userObjective = typeof req.body?.taskObjective === "string" ? req.body.taskObjective.trim() : "";
 
-    const job = bridge.getJob(jobId);
+    const job = bridge.getJob(jobId, auth.tenantId);
     if (!job || !job.result) {
-      return res.status(400).json({ error: "Analysis job has not completed yet" });
+      return res.status(404).json({ error: "Analysis job not found" });
+    }
+    if (job.workerId && job.workerId !== workerId) {
+      return res.status(404).json({ error: "Analysis job not found" });
     }
 
     try {
-      // 0. Locate extracted keyframes from job output directories
-    const outputDirsToSearch = [
-      (job as any).outputDir,
-      path.resolve("./evidence_output", auth.tenantId, workerId, jobId),
-      path.resolve("./evidence_output", auth.tenantId, (job.result.media_id || job.result.asset?.id || jobId)),
-      path.resolve(process.cwd(), "apps/api/evidence_output", auth.tenantId, (job.result.media_id || jobId)),
-      path.resolve(process.cwd(), "evidence_output", auth.tenantId, (job.result.media_id || jobId)),
-    ].filter(Boolean);
+    const states: any[] = job.result.timeline?.states || [];
+    const stateByFrame = new Map(states.map((s: any) => [s.frame_id, s]));
 
-    let framesDir: string | undefined;
-    for (const dir of outputDirsToSearch) {
-      const candidate = path.join(dir, "frames");
-      if (fs.existsSync(candidate)) {
-        framesDir = candidate;
-        break;
-      }
-    }
-
+    // Frames with their real timestamps, in recording order.
     const rawFrames: Array<{ frameId: string; timestamp: number; filePath: string }> = [];
-    const states = job.result.timeline?.states || [];
-    if (framesDir && fs.existsSync(framesDir)) {
-      const frameFiles = fs.readdirSync(framesDir).filter(f => f.match(/\.(jpg|jpeg|png|webp)$/i)).sort();
-      for (let i = 0; i < frameFiles.length; i++) {
-        const file = frameFiles[i]!;
-        const baseName = path.parse(file).name;
-        const matchedState = states.find((s: any) => s.frame_id === baseName);
-        const timestamp = matchedState?.timestamp ?? (i * 1.0);
-        rawFrames.push({
-          frameId: baseName,
-          timestamp,
-          filePath: path.join(framesDir, file)
-        });
+    let framesWithoutTimestamp = 0;
+    for (const f of job.result.frames || []) {
+      const filePath = f.image_path || f.thumbnail_path;
+      const timestamp = typeof f.timestamp_seconds === "number" ? f.timestamp_seconds : stateByFrame.get(f.frame_id)?.timestamp;
+      if (!filePath || !fs.existsSync(filePath)) continue;
+      if (typeof timestamp !== "number") { framesWithoutTimestamp++; continue; }
+      rawFrames.push({ frameId: f.frame_id, timestamp, filePath });
+    }
+    if (!rawFrames.length) {
+      const framesDir = [job.outputDir && path.join(job.outputDir, jobId, "frames"), path.resolve("./evidence_output", auth.tenantId, workerId, jobId, "frames")]
+        .filter((d): d is string => Boolean(d)).find(d => fs.existsSync(d));
+      if (framesDir) {
+        for (const file of fs.readdirSync(framesDir).filter(f => /\.(jpg|jpeg|png|webp)$/i.test(f)).sort()) {
+          const frameId = path.parse(file).name;
+          const timestamp = stateByFrame.get(frameId)?.timestamp;
+          if (typeof timestamp !== "number") { framesWithoutTimestamp++; continue; }
+          rawFrames.push({ frameId, timestamp, filePath: path.join(framesDir, file) });
+        }
+      }
+    }
+    rawFrames.sort((a, b) => a.timestamp - b.timestamp);
+
+    const ocrFacts: OcrFact[] = [];
+    for (const s of states) {
+      for (const t of s.visible_texts || []) {
+        if (typeof t === "string" && t.trim().length > 1) ocrFacts.push({ text: t.trim(), timestamp: s.timestamp, frameId: s.frame_id });
       }
     }
 
-    // 0.5 If OpenRouter is configured and frames exist, compile using multimodal OpenRouter pipeline
-    if (config.openRouterApiKey && !config.openRouterApiKey.includes("placeholder") && rawFrames.length > 0) {
-      try {
-        const ocrFacts: Array<{ text: string; timestamp?: number }> = [];
-        for (const s of states) {
-          const texts: string[] = s.visible_texts || [];
-          for (const t of texts) {
-            if (t && t.trim().length > 1) {
-              ocrFacts.push({ text: t.trim(), timestamp: s.timestamp });
-            }
-          }
+    const mediaPath = job.mediaPath || job.result.asset?.file_path || "";
+    const mediaName = path.basename(mediaPath || jobId);
+    const trainingBase = {
+      type: "VIDEO_RECORDING" as const,
+      name: mediaName,
+      documentId: job.documentId,
+      mediaId: job.documentId || job.result.media_id || jobId,
+      contentSha256: job.contentSha256,
+      jobId
+    };
+
+    // 0.5 Multimodal evidence-grounded path when a provider is configured and available.
+    const quotaManager = OpenRouterQuotaManager.getInstance();
+    const providerConfigured = Boolean(config.openRouterApiKey && !config.openRouterApiKey.includes("placeholder"));
+    let providerFailure: { status: string; message: string; resumable?: boolean } | undefined;
+
+    if (providerConfigured && rawFrames.length > 0 && quotaManager.isAvailable()) {
+      const rawObservations: RawVisualObservation[] = (job.result.semantic_actions || []).map((act: any, idx: number) => ({
+        id: act.id || `obs_${idx}`,
+        timestamp: typeof act.start_timestamp === "number" ? act.start_timestamp : (undefined as any),
+        type: act.action_type || "UNKNOWN",
+        application: act.application || states[0]?.active_application || "Browser",
+        windowTitle: act.window_title || states[0]?.active_window_title,
+        targetText: act.parameters?.url || act.target_description || act.parameters?.field_label || act.summary,
+        targetDescription: act.target_description || act.summary || act.parameters?.url,
+        value: act.parameters?.value || act.parameters?.url,
+        isClickTarget: act.action_type === "CLICK",
+        isTextMutation: act.action_type === "ENTER_VALUE" || act.action_type === "TYPE",
+        confidence: typeof act.confidence === "number" ? act.confidence : 0.5
+      }));
+
+      logger.info({ jobId, frameCount: rawFrames.length }, "[CompileFromJob] Running evidence-grounded multimodal compilation");
+      const pipeline = new EvidenceToWorkflowPipeline(config);
+      const pipelineResult: PipelineExecutionResult = await pipeline.executePipeline({
+        jobId,
+        mediaPath,
+        tenantId: auth.tenantId,
+        workerId,
+        rawFrames,
+        rawObservations,
+        ocrFacts,
+        activeApplication: states[0]?.active_application || "Browser",
+        taskObjective: userObjective,
+        taskContextHint: job.result.process_understanding?.task_intent,
+        checkpointDir: path.join(job.outputDir || path.resolve("./evidence_output", auth.tenantId, workerId), jobId, "llm_segments")
+      });
+
+      if (pipelineResult.success && pipelineResult.workflow) {
+        const workflow = pipelineResult.workflow;
+        const { version, readiness, bound } = await persistAndBind(auth, workerId, workflow, {
+          ...trainingBase,
+          analysisPath: "MULTIMODAL_EVIDENCE",
+          actionCount: pipelineResult.semanticActions?.length || 0,
+          frameCount: rawFrames.length,
+          fidelity: pipelineResult.grounding?.coverage.fidelity
+        });
+        job.result.compiledWorkflow = workflow;
+        job.result.compiledWorkflowVersionId = version.id;
+        job.result.grounding = pipelineResult.grounding;
+        if (!bound) {
+          return notExecutableResponse(res, jobId, version.id, readiness, { grounding: pipelineResult.grounding });
         }
+        return res.status(201).json({
+          workflowVersionId: version.id,
+          workflow,
+          analysisPath: "MULTIMODAL_EVIDENCE",
+          processUnderstanding: pipelineResult.processUnderstanding,
+          semanticActions: pipelineResult.semanticActions,
+          grounding: pipelineResult.grounding,
+          readiness: readiness.issues,
+          provenance: pipelineResult.provenance
+        });
+      }
 
-        const rawObservations: RawVisualObservation[] = (job.result.semantic_actions || []).map((act: any, idx: number) => ({
-          id: act.id || `obs_${idx}`,
-          timestamp: act.start_timestamp ?? (idx * 1.5),
-          type: act.action_type || "CLICK",
-          application: act.application || states[0]?.active_application || "Browser",
-          windowTitle: act.window_title || states[0]?.active_window_title,
-          targetText: act.summary || act.target_description || act.parameters?.field_label,
-          targetDescription: act.target_description || act.summary,
-          value: act.parameters?.value,
-          isClickTarget: act.action_type === "CLICK",
-          isTextMutation: act.action_type === "ENTER_VALUE" || act.action_type === "TYPE",
-          confidence: act.confidence ?? 0.9
-        }));
-
-        const targetMediaFile = job.result.asset?.file_path || job.mediaPath || "desktop_demonstration.webm";
-        const taskObjective = job.result.process_understanding?.task_intent || `Workflow demonstration from ${path.basename(targetMediaFile)}`;
-        const activeApp = states[0]?.active_application || "Browser";
-
-        logger.info({ jobId, frameCount: rawFrames.length }, "[CompileFromJob] Running OpenRouter multimodal evidence compilation on extracted keyframes");
-        const pipeline = new EvidenceToWorkflowPipeline(config);
-
-        const pipelineResult = await pipeline.executePipeline({
+      if (pipelineResult.status === "NEEDS_CLARIFICATION") {
+        // The evidence was interpreted and found insufficient; a weaker path must not override that.
+        job.result.grounding = pipelineResult.grounding;
+        return res.status(422).json({
+          success: false,
+          status: "NEEDS_CLARIFICATION",
+          error: pipelineResult.message,
           jobId,
-          mediaPath: targetMediaFile,
-          tenantId: auth.tenantId,
-          workerId,
-          rawFrames,
-          rawObservations,
-          ocrFacts,
-          activeApplication: activeApp,
-          taskObjective,
+          clarifications: (pipelineResult.grounding?.issues || []).filter(i => i.severity === "BLOCKING"),
+          warnings: (pipelineResult.grounding?.issues || []).filter(i => i.severity === "WARNING"),
+          grounding: pipelineResult.grounding,
+          provenance: pipelineResult.provenance
         });
-
-        if (pipelineResult.success && pipelineResult.workflow) {
-          const workflow = pipelineResult.workflow;
-          const workflowVersion = await store.createWorkflowVersion(auth, workflow as any);
-          const currentWorker = await store.getGhostWorker(auth, workerId);
-          const mediaName = path.basename(targetMediaFile);
-          const trainingSource = {
-            type: "VIDEO_RECORDING" as const,
-            name: mediaName,
-            mediaId: job.result.mediaId || jobId,
-            jobId,
-            actionCount: pipelineResult.semanticActions?.length || 0,
-            frameCount: rawFrames.length,
-            compiledAt: new Date().toISOString()
-          };
-
-          if ((store as any).purgeWorkerRuns) {
-            await (store as any).purgeWorkerRuns(auth, [workerId]);
-          }
-
-          await store.updateGhostWorker(auth, workerId, {
-            workflowId: workflowVersion.workflowId,
-            activeVersionId: workflowVersion.id,
-            status: "READY_FOR_REVIEW",
-            trainingSource,
-            triggerConfig: {
-              ...(currentWorker?.triggerConfig || {}),
-              trainingSource
-            }
-          } as any);
-
-          job.result.compiledWorkflow = workflow;
-          job.result.compiledWorkflowVersionId = workflowVersion.id;
-
-          return res.status(201).json({
-            bpsId: (workflow.compiler as any)?.bps_id || null,
-            workflowVersionId: workflowVersion.id,
-            workflow,
-            processUnderstanding: pipelineResult.processUnderstanding,
-            semanticActions: pipelineResult.semanticActions,
-            provenance: pipelineResult.provenance
-          });
-        } else if (pipelineResult.status === "AI_QUOTA_EXHAUSTED" || pipelineResult.error?.includes("RATE_LIMIT") || pipelineResult.error?.includes("429")) {
-          return res.status(429).json({
-            success: false,
-            status: "AI_QUOTA_EXHAUSTED",
-            error: "RATE_LIMITED_EXHAUSTED",
-            message: pipelineResult.message,
-            reason: pipelineResult.error || pipelineResult.message
-          });
-        }
-      } catch (pipeErr: any) {
-        logger.warn({ err: pipeErr.message, jobId }, "[CompileFromJob] OpenRouter pipeline error");
-        if (pipeErr.message?.includes("429") || pipeErr.message?.toLowerCase().includes("rate limit") || pipeErr.message?.toLowerCase().includes("quota")) {
-          return res.status(429).json({
-            success: false,
-            status: "AI_QUOTA_EXHAUSTED",
-            error: "RATE_LIMITED_EXHAUSTED",
-            message: `OpenRouter rate limit exhausted: ${pipeErr.message}`,
-            reason: pipeErr.message
-          });
-        }
       }
+
+      providerFailure = { status: pipelineResult.status, message: pipelineResult.message, ...(pipelineResult.resumable ? { resumable: true } : {}) };
+      logger.warn({ jobId, ...providerFailure }, "[CompileFromJob] Multimodal analysis unavailable; trying local computer-vision evidence");
+    } else if (providerConfigured && !quotaManager.isAvailable()) {
+      providerFailure = { status: "AI_QUOTA_EXHAUSTED", message: "The AI provider is cooling down after rate limiting or quota exhaustion." };
     }
 
-    // 1. Convert to NormalizedDemonstration
+    // 1. Local computer-vision evidence path. It compiles only from actions the local analyser grounded.
     const demo = bridge.toNormalizedDemonstration(job.result, auth.tenantId);
+    const failLocal = (message: string) => {
+      const status = providerFailure?.status === "AI_QUOTA_EXHAUSTED" ? 429 : providerFailure ? 503 : 422;
+      return res.status(status).json({
+        success: false,
+        status: providerFailure ? providerFailure.status : "NEEDS_CLARIFICATION",
+        error: providerFailure ? `${providerFailure.message} The local analysis could not substitute for it: ${message}` : message,
+        jobId,
+        providerFailure: providerFailure || null,
+        droppedActions: job.result.dropped_actions || [],
+        framesWithoutTimestamp
+      });
+    };
+    if (!demo.observations.length) {
+      return failLocal("No actionable interactions could be grounded in this recording. The workflow was not compiled.");
+    }
 
-    // 2. Process via BPI
-    const hasAnyLLM = Boolean(config.geminiApiKey || config.groqApiKey || config.openRouterApiKey || config.fallbackLlmApiKey);
-    const bpi = hasAnyLLM
-      ? new BusinessProcessIntelligence(aiProvider as any)
-      : new BusinessProcessIntelligence();
+    const localProc = job.result.process_understanding || {};
+    const localIntent = String(localProc.task_intent || "").trim();
+    const genericIntent = !localIntent || /^desktop task$|^video demonstration workflow$|^autonomous multi-step procedure across\b|^process for\b/i.test(localIntent);
+    const taskIntent = userObjective || (genericIntent ? "" : localIntent);
+    const applications = Array.isArray(localProc.applications_involved) && localProc.applications_involved.length > 0
+      ? localProc.applications_involved
+      : states.map((s: any) => s.active_application).filter(Boolean);
+    const applicationEnvironment = String(applications[0] || "").trim();
+    if (!taskIntent || !applicationEnvironment) {
+      return failLocal("The recording does not establish a clear task and application. Provide the task objective and retry; no workflow was compiled.");
+    }
 
+    const localVariables = Object.entries(localProc.variables || {}).map(([name, value]: [string, any]) => ({
+      name,
+      type: value.type || "string",
+      classification: value.classification || "RUNTIME_VARIABLE",
+      semanticRole: value.semantic_role || name,
+      ...(value.default_value !== undefined ? { defaultValue: value.default_value } : {})
+    }));
+    const processType = localProc.loops?.length ? "LOOP" : (localProc.conditionals?.length ? "CONDITIONAL" : "LINEAR");
+    const bpiProvider = new PrecomputedSemanticBPIProvider({
+      taskIntent,
+      applicationEnvironment,
+      processStructure: { type: processType, stepIndices: demo.observations.map((o: any) => o.sequence) },
+      variables: localVariables as any,
+      businessRules: [],
+      expectedOutcomes: [],
+      exceptions: (localProc.uncertainties || []).map((u: any) => ({
+        triggerCondition: u.description,
+        fallbackAction: u.clarification_question || "Request human clarification"
+      })),
+      confidence: typeof localProc.overall_confidence === "number" ? localProc.overall_confidence : 0.5
+    });
+
+    const bpi = new BusinessProcessIntelligence(bpiProvider as any);
     const bpiResult = await bpi.processDemonstration(demo);
+    if (bpiResult.specification.status === "NEEDS_CLARIFICATION" || bpiResult.specification.unresolvedGaps.some(g => g.blocking)) {
+      return failLocal(`Blocking gaps remain: ${bpiResult.specification.unresolvedGaps.filter(g => g.blocking).map(g => (g as any).description || (g as any).gap_id || (g as any).type).join("; ")}`);
+    }
 
     // 3. Persist BPS
     const bps = await store.createBPS(auth, {
@@ -440,128 +579,59 @@ export function createEvidenceRouter(config: ApiConfig, store: AppStore): Router
       gapsJson: bpiResult.gaps,
     });
 
-    // 4. Compile into WorkflowV2
+    // 4. Compile into WorkflowV2 from these observations only
     const compiler = new WorkflowCompiler(aiProvider);
-    const mediaName = job.result.mediaPath
-      ? path.basename(job.result.mediaPath)
-      : (job.result.mediaId || "Desktop Screen Recording");
-    const frameCount = (job.result as any).frames_analyzed || (job.result as any).framesCount || 0;
+    const frameCount = (job.result.frames || []).length;
     const actionCount = demo.observations.length;
+    const workflow = await compiler.compile(bpiResult.specification, { version: "desktop-evidence-compiler-2.0", evidenceSourced: true });
 
-    const workflow = await compiler.compile(bpiResult.specification, {
-      version: "desktop-evidence-compiler-1.0",
+    Object.assign(workflow.compiler as any, {
+      source_type: "VIDEO_RECORDING",
+      source_recording_id: jobId,
+      source_media_name: mediaName,
+      source_media_id: trainingBase.mediaId,
+      source_content_sha256: job.contentSha256,
+      action_count: actionCount,
+      frame_count: frameCount,
+      compiled_from: `Video Recording: ${mediaName}`,
+      analysis_path: "LOCAL_CV",
+      provider_failure: providerFailure || null,
+      dropped_actions: job.result.dropped_actions || []
     });
 
-    // Attach clear provenance directly to the workflow definition
-    (workflow.compiler as any).source_type = "VIDEO_RECORDING";
-    (workflow.compiler as any).source_recording_id = jobId;
-    (workflow.compiler as any).source_media_name = mediaName;
-    (workflow.compiler as any).source_media_id = job.result.mediaId || jobId;
-    (workflow.compiler as any).action_count = actionCount;
-    (workflow.compiler as any).frame_count = frameCount;
-    (workflow.compiler as any).compiled_from = `Video Recording: ${mediaName}`;
-
-    // 5. Create Workflow Version
-    const workflowVersion = await store.createWorkflowVersion(auth, workflow as any);
-
-    // 6. Update Ghost Worker with explicit training provenance
-    const currentWorker = await store.getGhostWorker(auth, workerId);
-    const trainingSource = {
-      type: "VIDEO_RECORDING" as const,
-      name: mediaName,
-      mediaId: job.result.mediaId,
-      jobId,
+    const { version, readiness, bound } = await persistAndBind(auth, workerId, workflow, {
+      ...trainingBase,
+      analysisPath: "LOCAL_CV",
       actionCount,
-      frameCount,
-      compiledAt: new Date().toISOString()
-    };
+      frameCount
+    }, bps.id);
 
-    if ((store as any).purgeWorkerRuns) {
-      await (store as any).purgeWorkerRuns(auth, [workerId]);
-    }
-
-    await store.updateGhostWorker(auth, workerId, {
-      workflowId: workflowVersion.workflowId,
-      activeVersionId: workflowVersion.id,
-      bpsId: bps.id,
-      status: "READY_FOR_REVIEW",
-      trainingSource,
-      triggerConfig: {
-        ...(currentWorker?.triggerConfig || {}),
-        trainingSource
-      }
-    } as any);
-
-    // 6.5 Ensure this video demonstration is registered in worker_documents as verified forensic evidence
-    try {
-      const existingDocs = await store.listDocuments(auth, workerId);
-      const docParsedJson = {
-        filePath: job.result.mediaPath,
-        mediaId: job.result.mediaId,
-        jobId,
-        actionCount,
-        frameCount,
-        steps: demo.observations.map((o: any) => o.description || o.action_type || o.summary),
-        rules: bpiResult.specification.businessRules || [],
-        summary: `Learned from Video Recording: ${mediaName} (${actionCount} actions)`,
-        compiledAt: new Date().toISOString()
-      };
-
-      const matchingDoc = existingDocs.find(d => 
-        (d.parsedJson as any)?.jobId === jobId || 
-        (d.parsedJson as any)?.mediaId === job.result.mediaId ||
-        d.name === mediaName
-      );
-
-      if (matchingDoc) {
-        try {
-          await store.deleteDocument(auth, matchingDoc.id);
-        } catch {}
-      }
-
-      await store.createDocument(auth, {
-        workerId,
-        type: "VIDEO",
-        name: mediaName,
-        parsedJson: docParsedJson
-      });
-      logger.info({ workerId, mediaName, actionCount }, "Registered compiled video demonstration into worker_documents");
-    } catch (docErr) {
-      logger.warn({ err: docErr, workerId }, "Failed to register video demonstration into worker_documents");
-    }
-
-    // 6. Cache compilation result onto job and persist to disk so it is stored and reused
     job.result.compiledWorkflow = workflow;
-    job.result.compiledWorkflowVersionId = workflowVersion.id;
+    job.result.compiledWorkflowVersionId = version.id;
     job.result.bpsId = bps.id;
     job.result.specification = bpiResult.specification;
-
     try {
-      const outDir = (job as any).outputDir || path.resolve("./evidence_output", auth.tenantId, workerId);
-      const resultJsonPath = path.join(outDir, "analysis_result.json");
-      if (fs.existsSync(resultJsonPath)) {
-        fs.writeFileSync(resultJsonPath, JSON.stringify(job.result, null, 2), "utf8");
-      }
+      const resultJsonPath = path.join(job.outputDir || path.resolve("./evidence_output", auth.tenantId, workerId), jobId, "analysis_result.json");
+      if (fs.existsSync(resultJsonPath)) fs.writeFileSync(resultJsonPath, JSON.stringify(job.result, null, 2), "utf8");
     } catch (persistErr) {
       logger.warn({ err: persistErr, jobId }, "Failed to update analysis_result.json with compiled workflow");
     }
 
-    logger.info({
-      workerId,
-      jobId,
-      workflowVersionId: workflowVersion.id,
-      sourceMedia: mediaName,
-      sourceType: "VIDEO_RECORDING",
-      frameCount,
-      actionCount
-    }, `Compiled workflow from uploaded video recording: "${mediaName}" (${actionCount} actions, ${frameCount} frames)`);
+    if (!bound) {
+      return notExecutableResponse(res, jobId, version.id, readiness, { analysisPath: "LOCAL_CV", providerFailure: providerFailure || null });
+    }
 
+    logger.info({ workerId, jobId, workflowVersionId: version.id, actionCount, frameCount }, "Compiled workflow from local computer-vision evidence");
     res.status(201).json({
       bpsId: bps.id,
-      workflowVersionId: workflowVersion.id,
+      workflowVersionId: version.id,
       workflow,
+      analysisPath: "LOCAL_CV",
+      providerFailure: providerFailure || null,
+      readiness: readiness.issues,
       processUnderstanding: job.result.process_understanding,
       uncertainties: job.result.uncertainties,
+      droppedActions: job.result.dropped_actions || [],
       specification: bpiResult.specification,
     });
   } catch (err: any) {
@@ -570,69 +640,56 @@ export function createEvidenceRouter(config: ApiConfig, store: AppStore): Router
   }
   }));
 
-  // 5.5 Run OpenRouter Evidence-to-Workflow Pipeline Directly
+  // 5.5 Run the evidence-to-workflow pipeline directly on an uploaded document
   router.post("/pipeline/compile", asyncHandler(async (req, res) => {
     const auth = req.auth!;
     const workerId = param(req, "id");
-    const { filePath, videoPath, documentId, assetId, taskObjective, activeApplication } = req.body;
-
-    let targetPath = filePath || videoPath;
-    const docId = documentId || assetId;
-    if (!targetPath && docId) {
-      const doc = await store.getDocument(auth, docId);
-      targetPath = (doc?.parsedJson as any)?.filePath;
+    const media = await resolveWorkerMedia(store, auth, workerId, req.body || {});
+    if ("error" in media) {
+      return res.status(media.status).json({ error: media.error });
     }
-
-    if (!targetPath || !fs.existsSync(targetPath)) {
-      return res.status(400).json({ error: `Evidence file not found: ${targetPath || 'no path specified'}` });
-    }
+    const { taskObjective, activeApplication } = req.body;
 
     const jobId = `pipe_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+    const outputDir = path.resolve("./evidence_output", auth.tenantId, workerId, jobId);
     const pipeline = new EvidenceToWorkflowPipeline(config);
-
     const pipelineResult = await pipeline.executePipeline({
       jobId,
-      mediaPath: targetPath,
+      mediaPath: media.filePath,
       tenantId: auth.tenantId,
       workerId,
       taskObjective,
       activeApplication,
+      checkpointDir: path.join(outputDir, "llm_segments")
     });
 
     if (!pipelineResult.success || !pipelineResult.workflow) {
-      if (pipelineResult.status === "AI_QUOTA_EXHAUSTED") {
-        return res.status(429).json({
-          status: "AI_QUOTA_EXHAUSTED",
-          error: "AI_QUOTA_EXHAUSTED",
-          message: pipelineResult.message,
-        });
-      }
-      return res.status(422).json({
-        status: "ANALYSIS_FAILED",
-        error: "ANALYSIS_FAILED",
+      const status = pipelineResult.status === "AI_QUOTA_EXHAUSTED" ? 429 : pipelineResult.status === "NEEDS_RETRY" ? 503 : 422;
+      return res.status(status).json({
+        status: pipelineResult.status,
+        error: pipelineResult.status,
         message: pipelineResult.message,
+        resumable: Boolean(pipelineResult.resumable),
+        clarifications: (pipelineResult.grounding?.issues || []).filter(i => i.severity === "BLOCKING"),
+        provenance: pipelineResult.provenance
       });
     }
 
-    let workflowVersion = null;
-    try {
-      const mediaName = path.basename(targetPath);
-      workflowVersion = await store.createWorkflowVersion(auth, pipelineResult.workflow as any);
-
-      await store.createDocument(auth, {
-        workerId,
-        type: targetPath.endsWith(".mp4") ? "VIDEO" : "IMAGE",
-        name: mediaName,
-        parsedJson: {
-          filePath: targetPath,
-          jobId,
-          actionCount: pipelineResult.semanticActions?.length || 0,
-          summary: `Compiled via OpenRouter Evidence Pipeline: ${mediaName}`,
-          compiledAt: new Date().toISOString(),
-        }
-      });
-    } catch (saveErr: any) {
-      logger.warn({ err: saveErr.message }, "Could not persist compiled pipeline workflow to store");
+    // A compilation is reported as successful only after it has been persisted.
+    const mediaName = media.doc?.name || path.basename(media.filePath);
+    const { version, readiness, bound } = await persistAndBind(auth, workerId, pipelineResult.workflow, {
+      type: "VIDEO_RECORDING",
+      name: mediaName,
+      documentId: media.doc?.id,
+      mediaId: media.doc?.id || jobId,
+      contentSha256: media.contentSha256,
+      jobId,
+      analysisPath: "MULTIMODAL_EVIDENCE",
+      actionCount: pipelineResult.semanticActions?.length || 0,
+      fidelity: pipelineResult.grounding?.coverage.fidelity
+    });
+    if (!bound) {
+      return notExecutableResponse(res, jobId, version.id, readiness, { grounding: pipelineResult.grounding });
     }
 
     return res.status(201).json({
@@ -640,9 +697,11 @@ export function createEvidenceRouter(config: ApiConfig, store: AppStore): Router
       status: "COMPLETED",
       jobId,
       workflow: pipelineResult.workflow,
-      workflowVersionId: workflowVersion?.id || null,
+      workflowVersionId: version.id,
       semanticActions: pipelineResult.semanticActions,
       processUnderstanding: pipelineResult.processUnderstanding,
+      grounding: pipelineResult.grounding,
+      readiness: readiness.issues,
       provenance: pipelineResult.provenance,
     });
   }));
@@ -652,21 +711,20 @@ export function createEvidenceRouter(config: ApiConfig, store: AppStore): Router
     const auth = req.auth!;
     const workerId = param(req, "id");
     const docId = param(req, "docId");
+    const doc = await store.getDocument(auth, docId).catch(() => undefined);
+    // A missing document must not report success or trigger the worker purge below.
+    if (!doc || (doc.workerId && doc.workerId !== workerId)) {
+      return res.status(404).json({ error: "Evidence document not found" });
+    }
     try {
       await store.deleteDocument(auth, docId);
     } catch (_) {}
 
-    // Clean physical files if docId corresponds to a file or media
-    try {
-      const storageDir = path.resolve("./evidence_storage", auth.tenantId, workerId);
-      if (fs.existsSync(storageDir)) {
-        for (const f of fs.readdirSync(storageDir)) {
-          if (f.includes(docId)) {
-            try { fs.rmSync(path.join(storageDir, f), { force: true }); } catch (_) {}
-          }
-        }
-      }
-    } catch (_) {}
+    // Remove the stored file only when it lives inside this worker's own storage.
+    const filePath = (doc?.parsedJson as any)?.filePath;
+    if (filePath && isInsideStorage(filePath, auth.tenantId, workerId)) {
+      try { fs.rmSync(filePath, { force: true }); } catch (_) {}
+    }
 
     const purgeResult = await purgeOrRecompileWorkerAfterDocDeletion(config, store, auth, workerId, docId, aiProvider);
     res.json({

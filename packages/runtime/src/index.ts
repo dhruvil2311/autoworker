@@ -1,4 +1,4 @@
-export { WorkflowRuntime } from "./runtime.js";
+export { WorkflowRuntime, RunStoppedError } from "./runtime.js";
 export type { ExecutionPersistence } from "./runtime.js";
 export { ExecutionPlanner } from "./planner.js";
 export { RuntimeContext, VariableResolver } from "./context.js";

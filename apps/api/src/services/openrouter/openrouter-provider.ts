@@ -1,5 +1,4 @@
 import * as fs from "fs";
-import * as path from "path";
 import { logger } from "@ghost/observability";
 import type { ApiConfig } from "../../config.js";
 import {
@@ -31,18 +30,86 @@ export function cleanJsonPayload(raw: string): string {
   return text;
 }
 
+/** Parses Retry-After (seconds or HTTP date) into milliseconds. */
+export function parseRetryAfterMs(header: string | null | undefined, now: number = Date.now()): number | undefined {
+  if (!header) return undefined;
+  const seconds = Number(header);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1000);
+  const date = Date.parse(header);
+  return Number.isFinite(date) ? Math.max(0, date - now) : undefined;
+}
+
+/** Exponential backoff with full jitter, capped. */
+export function backoffDelayMs(attempt: number, baseMs = 1000, capMs = 15_000, random: () => number = Math.random): number {
+  const ceiling = Math.min(capMs, baseMs * Math.pow(2, Math.max(0, attempt - 1)));
+  return Math.round(ceiling / 2 + random() * (ceiling / 2));
+}
+
+/** Counts action objects in a (possibly broken) JSON text; a repair may never exceed this. */
+function countActionObjects(text: string): number {
+  return (text.match(/"action"\s*:/g) || []).length;
+}
+
+const SUPPORTED_ACTIONS = "NAVIGATE, CLICK, TYPE, SELECT, KEYPRESS, SCROLL, WAIT, EXTRACT, VERIFY";
+
+export const SEMANTIC_EXTRACTION_PROMPT_VERSION = "evidence-grounded-2";
+
+const SEMANTIC_EXTRACTION_PROMPT = `You reconstruct the workflow a user demonstrated in a screen recording, using only the evidence provided.
+
+Evidence you receive:
+- Chronological keyframes. Each image is preceded by a text label "FRAME <frameId> @ <seconds>s".
+- Interaction episodes detected by local computer vision (before/action/after), with ids like ep_01.
+- OCR text lines with timestamps.
+
+Rules:
+1. Report only actions the evidence shows. Do not add steps from general knowledge of how an application usually works, and do not complete a process the recording does not complete.
+2. Every action must cite its evidence in "evidenceEpisodeIds" using the exact episode ids and/or frame ids given to you.
+3. "evidenceStatus" is "OBSERVED" only when the action is visible in the cited evidence, "INFERRED" when it is implied by the change between cited frames (for example a field that becomes filled), and "UNKNOWN" otherwise.
+4. "arguments.target" is the visible label or text of the control exactly as shown on screen. "arguments.value" is the exact text typed or option chosen, copied from the frames. If a value is unreadable, omit it and say so in "rationale".
+5. Copy address-bar URLs verbatim, including every subdomain, path and query. If the address is clipped or unreadable, omit "arguments.url" and record the uncertainty in "unresolved".
+6. Use only these action names: ${SUPPORTED_ACTIONS}. If the user did something these cannot express, emit action "UNSUPPORTED" and describe it in "rationale".
+7. Ignore recording-tool UI, operating-system chrome, idle time and cursor movement that changes nothing; list what you ignored in "discardedNoise".
+8. List anything you saw but could not interpret in "unresolved" instead of guessing.
+9. "processUnderstanding.taskIntent" states the user's goal only as far as the evidence supports it. Leave it empty if the goal is not evident.
+
+Return JSON only:
+{
+  "semanticActions": [
+    { "action": "CLICK", "arguments": { "target": "visible label", "value": "typed text", "url": "address" },
+      "application": "Browser", "evidenceEpisodeIds": ["ep_01", "frame_000004"], "confidence": 0.0,
+      "evidenceStatus": "OBSERVED", "rationale": "what in the cited evidence shows this" }
+  ],
+  "processUnderstanding": {
+    "taskIntent": "", "applicationEnvironment": "Web Browser | Windows Desktop | Mixed",
+    "processStructure": { "type": "LINEAR", "stepIndices": [] },
+    "variables": [], "businessRules": [], "expectedOutcomes": [], "exceptions": [], "confidence": 0.0
+  },
+  "discardedNoise": [],
+  "unresolved": []
+}`;
+
+interface CompletionResult {
+  content: string;
+  model: string;
+  finishReason?: string | undefined;
+}
+
 export class OpenRouterProvider implements VisionReasoningProvider {
   private quotaManager: OpenRouterQuotaManager;
   private apiKey: string;
   private baseUrl: string;
   private visionModel: string;
   private reasoningModel: string;
+  private fallbackVisionModels: string[];
   private siteUrl?: string;
   private siteName?: string;
   private maxRetries: number;
-  private timeoutMs: number = 45_000;
+  private timeoutMs: number;
+  /** Longest provider-requested wait the request loop will sleep through before giving up. */
+  private maxRetryAfterWaitMs = 20_000;
+  private sleep: (ms: number) => Promise<void> = ms => new Promise(r => setTimeout(r, ms));
 
-  constructor(private config: ApiConfig) {
+  constructor(private config: ApiConfig, private fetchImpl: typeof fetch = (...args) => fetch(...args)) {
     this.quotaManager = OpenRouterQuotaManager.getInstance({
       allowPaidModels: config.allowPaidModels,
       maxConcurrentRequests: config.openRouterMaxConcurrentRequests,
@@ -52,23 +119,32 @@ export class OpenRouterProvider implements VisionReasoningProvider {
     this.baseUrl = (config.openRouterBaseUrl || "https://openrouter.ai/api/v1").replace(/\/+$/, "");
     this.visionModel = config.openRouterVisionModel || config.openRouterModel || "qwen/qwen3.8-27b:free";
     this.reasoningModel = config.openRouterReasoningModel || config.openRouterModel || "qwen/qwen3.8-27b:free";
+    this.fallbackVisionModels = (config.openRouterFallbackVisionModels || []).filter(m => m && m !== this.visionModel);
     this.siteUrl = config.openRouterSiteUrl || config.appUrl;
     this.siteName = config.openRouterSiteName || "Ghost Desktop Automation";
     this.maxRetries = config.openRouterMaxRetries ?? 1;
+    this.timeoutMs = config.openRouterRequestTimeoutMs ?? 60_000;
   }
 
   public getQuotaManager(): OpenRouterQuotaManager {
     return this.quotaManager;
   }
 
+  /** Test seam: replaces real sleeping in retry paths. */
+  public setSleep(fn: (ms: number) => Promise<void>): void {
+    this.sleep = fn;
+  }
+
   /**
-   * Dispatches a chat completion request to OpenRouter with strict quota, cost-guard, and error handling.
+   * Dispatches one chat completion with bounded retries. Retries cover timeouts, network errors,
+   * 5xx and short Retry-After rate limits; authentication, payment, bad-request and long
+   * rate-limit responses fail immediately with a typed error.
    */
   private async executeChatCompletion(
     model: string,
     messages: any[],
     options: { maxTokens?: number; temperature?: number } = {}
-  ): Promise<string> {
+  ): Promise<CompletionResult> {
     if (!this.apiKey) {
       throw new OpenRouterError(
         "AUTH_ERROR",
@@ -77,11 +153,7 @@ export class OpenRouterProvider implements VisionReasoningProvider {
       );
     }
 
-    // 1. Enforce Cost Guard
     this.quotaManager.checkCostGuard(model);
-
-    // 2. Enforce Quota & Concurrency
-    this.quotaManager.acquireSlot();
 
     const url = `${this.baseUrl}/chat/completions`;
     const headers: Record<string, string> = {
@@ -100,146 +172,125 @@ export class OpenRouterProvider implements VisionReasoningProvider {
     };
 
     const startTime = Date.now();
-    let attempt = 0;
     const maxAttempts = 1 + Math.max(0, this.maxRetries);
 
-    while (attempt < maxAttempts) {
-      attempt++;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      await this.quotaManager.acquireSlotWithWait();
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
+      let response: Response;
       try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
-
-        logger.info(
-          { model, attempt, maxAttempts, url },
-          `[OpenRouter] Dispatching inference request (${model})`
-        );
-
-        const response = await fetch(url, {
-          method: "POST",
-          headers,
-          body: JSON.stringify(body),
-          signal: controller.signal
-        });
-
-        clearTimeout(timeoutId);
-        const duration = Date.now() - startTime;
-
-        if (!response.ok) {
-          const status = response.status;
-          const errorText = await response.text().catch(() => "");
-          logger.warn({ status, errorText, duration, model }, "[OpenRouter] HTTP error response");
-
-          if (status === 401) {
-            this.quotaManager.recordFailure(status, "Authentication failed");
-            throw new OpenRouterError("AUTH_ERROR", `OpenRouter auth error: ${errorText}`, 401);
-          }
-          if (status === 402) {
-            this.quotaManager.recordFailure(status, "Payment required");
-            throw new OpenRouterError("PAYMENT_REQUIRED", `OpenRouter payment required: ${errorText}`, 402);
-          }
-          if (status === 429) {
-            this.quotaManager.recordFailure(status, "Rate limit reached");
-            // Do not retry 429 in a tight loop
-            throw new OpenRouterError("RATE_LIMITED", `OpenRouter rate limit reached: ${errorText}`, 429);
-          }
-          if (status === 400) {
-            this.quotaManager.recordFailure(status, "Invalid request");
-            throw new OpenRouterError("INVALID_REQUEST", `OpenRouter bad request: ${errorText}`, 400);
-          }
-          if (status >= 500) {
-            this.quotaManager.recordFailure(status, `Provider 5xx error: ${errorText}`);
-            if (attempt < maxAttempts) {
-              await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
-              continue;
-            }
-            throw new OpenRouterError("PROVIDER_ERROR", `OpenRouter service error (${status}): ${errorText}`, status);
-          }
-
-          this.quotaManager.recordFailure(status, errorText);
-          throw new OpenRouterError("UNKNOWN_ERROR", `OpenRouter error (${status}): ${errorText}`, status);
-        }
-
-        const data: any = await response.json();
-        const msg = data?.choices?.[0]?.message;
-        const content = (msg?.content && typeof msg.content === "string" && msg.content.trim().length > 0)
-          ? msg.content
-          : (msg?.reasoning || msg?.reasoning_details?.[0]?.text || "");
-
-        if (!content || typeof content !== "string") {
-          this.quotaManager.recordFailure(200, "Empty choice content");
-          throw new OpenRouterError("MALFORMED_OUTPUT", "OpenRouter returned empty message content in response.", 200);
-        }
-
-        const tokensEstimate = data?.usage?.total_tokens || Math.ceil(content.length / 4);
-        this.quotaManager.recordSuccess(tokensEstimate);
-
-        logger.info(
-          { model, duration, tokensEstimate },
-          `[OpenRouter] Successfully received response (${duration}ms)`
-        );
-
-        return content;
+        logger.info({ model, attempt, maxAttempts }, `[OpenRouter] Dispatching inference request (${model})`);
+        response = await this.fetchImpl(url, { method: "POST", headers, body: JSON.stringify(body), signal: controller.signal });
       } catch (err: any) {
-        if (err.name === "AbortError") {
-          this.quotaManager.recordFailure(408, "Request timeout");
-          throw new OpenRouterError("TIMEOUT", `OpenRouter request timed out after ${this.timeoutMs}ms`, 408);
-        }
-        if (err instanceof OpenRouterError) {
-          throw err;
-        }
+        clearTimeout(timeoutId);
+        const timedOut = err?.name === "AbortError";
         if (attempt < maxAttempts) {
-          logger.warn({ err: err.message, attempt }, "[OpenRouter] Retrying request after error");
-          await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
+          this.quotaManager.releaseSlot();
+          logger.warn({ err: err?.message, attempt, timedOut }, "[OpenRouter] Request failed before a response; retrying");
+          await this.sleep(backoffDelayMs(attempt));
           continue;
         }
-        this.quotaManager.recordFailure(500, err.message);
-        throw new OpenRouterError("UNKNOWN_ERROR", `OpenRouter communication failed: ${err.message}`);
+        this.quotaManager.recordFailure(timedOut ? 408 : 503, err?.message, { modelScoped: true });
+        throw timedOut
+          ? new OpenRouterError("TIMEOUT", `OpenRouter request timed out after ${this.timeoutMs}ms`, 408)
+          : new OpenRouterError("SERVICE_UNAVAILABLE", `OpenRouter communication failed: ${err?.message}`, 503);
       }
+      clearTimeout(timeoutId);
+      const duration = Date.now() - startTime;
+
+      if (!response.ok) {
+        const status = response.status;
+        const errorText = await response.text().catch(() => "");
+        const retryAfterMs = parseRetryAfterMs(response.headers?.get?.("retry-after"));
+        logger.warn({ status, errorText: errorText.slice(0, 300), duration, model, retryAfterMs }, "[OpenRouter] HTTP error response");
+
+        if (status === 401 || status === 403) {
+          this.quotaManager.recordFailure(status, "Authentication failed");
+          throw new OpenRouterError(status === 401 ? "AUTH_ERROR" : "ACCESS_DENIED", `OpenRouter auth error: ${errorText}`, status);
+        }
+        if (status === 402) {
+          this.quotaManager.recordFailure(status, "Payment required");
+          throw new OpenRouterError("PAYMENT_REQUIRED", `OpenRouter payment required: ${errorText}`, 402);
+        }
+        if (status === 429) {
+          const shortWait = retryAfterMs !== undefined && retryAfterMs <= this.maxRetryAfterWaitMs;
+          if (shortWait && attempt < maxAttempts) {
+            this.quotaManager.releaseSlot();
+            await this.sleep(retryAfterMs! + backoffDelayMs(1, 250, 1000));
+            continue;
+          }
+          this.quotaManager.recordFailure(new OpenRouterError("RATE_LIMITED", `OpenRouter rate limit reached: ${errorText}`, 429));
+          if (retryAfterMs) this.quotaManager.applyCooldown(retryAfterMs);
+          throw new OpenRouterError("RATE_LIMITED", `OpenRouter rate limit reached: ${errorText}`, 429, { retryAfterMs });
+        }
+        if (status === 400 || status === 413) {
+          this.quotaManager.recordFailure(status, "Invalid request");
+          throw new OpenRouterError("INVALID_REQUEST", `OpenRouter bad request: ${errorText}`, status);
+        }
+        if (status >= 500) {
+          if (attempt < maxAttempts) {
+            this.quotaManager.releaseSlot();
+            await this.sleep(retryAfterMs ?? backoffDelayMs(attempt));
+            continue;
+          }
+          this.quotaManager.recordFailure(status, `Provider 5xx error: ${errorText}`, { modelScoped: true });
+          throw new OpenRouterError("PROVIDER_ERROR", `OpenRouter service error (${status}): ${errorText}`, status);
+        }
+        this.quotaManager.recordFailure(status, errorText);
+        throw new OpenRouterError("UNKNOWN_ERROR", `OpenRouter error (${status}): ${errorText}`, status);
+      }
+
+      const data: any = await response.json().catch(() => null);
+      const choice = data?.choices?.[0];
+      const msg = choice?.message;
+      const content = (msg?.content && typeof msg.content === "string" && msg.content.trim().length > 0)
+        ? msg.content
+        : (msg?.reasoning || msg?.reasoning_details?.[0]?.text || "");
+      const finishReason = choice?.finish_reason || choice?.native_finish_reason;
+
+      if (!content || typeof content !== "string") {
+        this.quotaManager.recordFailure(200, "Empty choice content");
+        throw new OpenRouterError("MALFORMED_OUTPUT", "OpenRouter returned empty message content in response.", 200);
+      }
+
+      const tokensEstimate = data?.usage?.total_tokens || Math.ceil(content.length / 4);
+      this.quotaManager.recordSuccess(tokensEstimate);
+      logger.info({ model, duration, tokensEstimate, finishReason }, `[OpenRouter] Successfully received response (${duration}ms)`);
+      return { content, model, finishReason };
     }
 
     throw new OpenRouterError("TIMEOUT", "Max retry attempts exceeded without response");
   }
 
+  /** Vision call with explicitly configured fallback models for provider-side failures only. */
+  private async executeVisionCompletion(messages: any[]): Promise<CompletionResult> {
+    const models = [this.visionModel, ...this.fallbackVisionModels];
+    let lastError: unknown;
+    for (const model of models) {
+      try {
+        return await this.executeChatCompletion(model, messages);
+      } catch (err) {
+        lastError = err;
+        const retryable = err instanceof OpenRouterError && ["PROVIDER_ERROR", "TIMEOUT", "SERVICE_UNAVAILABLE"].includes(err.type);
+        if (!retryable) throw err;
+        logger.warn({ model, type: (err as OpenRouterError).type }, "[OpenRouter] Vision model failed; trying next configured vision model");
+      }
+    }
+    throw lastError;
+  }
+
   /**
    * OpenRouter Call #1 — Semantic Action Extraction from Evidence Episodes.
-   * Concurrently compresses evidence and outputs structured JSON only.
+   * Each attached image is labelled with its frame id so actions can cite the frames they come from.
    */
   public async extractSemanticActions(packet: SemanticEvidencePacket): Promise<SemanticActionsResult> {
-    const systemPrompt = `You are an expert computer automation engineer reconstructing the complete task workflow performed by a user from evidence episodes and sequential video frames.
-
-CRITICAL TASK RULES:
-1. Examine the attached chronological keyframes and episodes showing the user demonstration.
-2. Reconstruct the complete, ordered sequence of interactions required to reproduce the task:
-   - Initial navigation (e.g. NAVIGATE to the web application URL).
-   - Form inputs (e.g. TYPE or ENTER username, password, first name, last name, postal code). Always include the exact text value typed in arguments.value.
-   - Button and link clicks (e.g. CLICK login button, product title link, add to cart, shopping cart link, checkout button, continue button). Include the target element name/id in arguments.target.
-   - Data verification / extraction (e.g. EXTRACT or VERIFY the summary total or completion state).
-3. Do not omit intermediate steps (such as adding an item to the cart, clicking into the cart, or clicking checkout).
-4. Ignore passive OS chrome (taskbars, minimize buttons, system tray).
-5. Output cleanly structured JSON only:
-{
-  "semanticActions": [
-    {
-      "action": "ACTION_NAME",
-      "arguments": { "target": "element_name", "value": "text_if_typing", "url": "url_if_navigating" },
-      "application": "Browser",
-      "evidenceEpisodeIds": ["ep_01"],
-      "confidence": 0.95,
-      "evidenceStatus": "OBSERVED",
-      "rationale": "Clear description of action and why it occurred"
-    }
-  ],
-  "discardedNoise": [
-    "description of ignored noise"
-  ]
-}`;
-
-    // Package episodes concisely
     const condensedEpisodes = packet.episodes.map(ep => ({
       episodeId: ep.episodeId,
       time: `${ep.timestampStart.toFixed(1)}s - ${ep.timestampEnd.toFixed(1)}s`,
       application: ep.application,
       windowTitle: ep.windowTitle,
+      frames: [...ep.before.frames, ...ep.after.frames].map(f => f.frameId),
       action: {
         type: ep.action.type,
         target: ep.action.targetText,
@@ -247,92 +298,82 @@ CRITICAL TASK RULES:
         source: ep.action.source,
         confidence: ep.action.confidence
       },
-      beforeOcrSummary: ep.before.ocr.slice(0, 8).map(o => o.text),
-      afterOcrSummary: ep.after.ocr.slice(0, 8).map(o => o.text)
+      beforeOcr: ep.before.ocr.slice(0, 12).map(o => o.text),
+      afterOcr: ep.after.ocr.slice(0, 12).map(o => o.text)
     }));
 
-    const userContent: any[] = [
-      {
-        type: "text",
-        text: `Task Context: ${packet.taskContext || "Desktop/Browser Demonstration"}\nActive Application: ${packet.activeApplication}\nEvidence Episodes:\n${JSON.stringify(condensedEpisodes, null, 2)}`
-      }
-    ];
+    const ocrLines = (packet.timedOcr && packet.timedOcr.length)
+      ? packet.timedOcr.map(o => `${typeof o.timestamp === "number" ? `[${o.timestamp.toFixed(1)}s]` : "[?]"} ${o.text}`)
+      : packet.ocrFacts;
+    const preceding = (packet.precedingActions || []).map((a, i) => `${i + 1}. ${a.action}${a.target ? ` "${a.target}"` : ""}${a.value ? ` = "${a.value}"` : ""}`);
 
-    // Select up to 6 keyframes across the recording to ensure fast inference and prevent massive payloads
-    const maxImages = 6;
-    const framesToAttach: FrameEvidence[] = [];
+    const header = [
+      `Task context from the user: ${packet.taskContext || "(none provided)"}`,
+      `Active application: ${packet.activeApplication}`,
+      packet.segment ? `Segment ${packet.segment.index + 1} of ${packet.segment.total} (${packet.timestamps.start.toFixed(1)}s - ${packet.timestamps.end.toFixed(1)}s).` : "",
+      preceding.length ? `Actions already reconstructed from earlier segments (do not repeat them; continue from here):\n${preceding.join("\n")}` : "",
+      `OCR text (verbatim; preserve exact URL spelling):\n${ocrLines.join("\n") || "(no OCR text)"}`,
+      `Evidence episodes:\n${JSON.stringify(condensedEpisodes, null, 2)}`
+    ].filter(Boolean).join("\n\n");
 
-    if (packet.keyFrames && packet.keyFrames.length > 0) {
-      if (packet.keyFrames.length <= maxImages) {
-        framesToAttach.push(...packet.keyFrames);
-      } else {
-        const step = (packet.keyFrames.length - 1) / (maxImages - 1);
-        for (let i = 0; i < maxImages; i++) {
-          const idx = Math.min(Math.round(i * step), packet.keyFrames.length - 1);
-          const kf = packet.keyFrames[idx];
-          if (kf) framesToAttach.push(kf);
-        }
-      }
-    } else {
-      for (const ep of packet.episodes) {
-        const frame = ep.after.frames[0] || ep.before.frames[0];
-        if (frame) framesToAttach.push(frame);
-      }
-    }
+    const userContent: any[] = [{ type: "text", text: header }];
 
-    const attachedFrameIds = new Set<string>();
+    const framesToAttach: FrameEvidence[] = packet.keyFrames && packet.keyFrames.length
+      ? packet.keyFrames
+      : packet.episodes.map(ep => ep.after.frames[0] || ep.before.frames[0]).filter((f): f is FrameEvidence => Boolean(f));
+
+    const attached = new Set<string>();
     for (const frame of framesToAttach) {
-      if (!frame || attachedFrameIds.has(frame.frameId)) continue;
-
+      if (!frame || attached.has(frame.frameId)) continue;
+      // Keep original resolution: address bars and small labels are unreadable in thumbnails.
       let b64 = frame.base64;
-      // Prefer compressed thumbnail if available to keep network payload ultra-lean (<150KB) and fast
-      if (frame.imagePath) {
-        const thumbCandidate1 = frame.imagePath.replace(/[\\\/]frames[\\\/]/, "/thumbnails/").replace(/\.jpg$/, "_thumb.jpg");
-        const thumbCandidate2 = path.join(path.dirname(frame.imagePath), "..", "thumbnails", `${frame.frameId}_thumb.jpg`);
-        const thumbPath = fs.existsSync(thumbCandidate1) ? thumbCandidate1 : (fs.existsSync(thumbCandidate2) ? thumbCandidate2 : null);
-        if (thumbPath) {
-          try {
-            b64 = fs.readFileSync(thumbPath).toString("base64");
-          } catch (_) {}
-        }
+      if (!b64 && frame.imagePath && fs.existsSync(frame.imagePath)) {
+        try { b64 = fs.readFileSync(frame.imagePath).toString("base64"); } catch { /* Skip unreadable frame. */ }
       }
-
-      if (b64) {
-        userContent.push({
-          type: "image_url",
-          image_url: {
-            url: b64.startsWith("data:") ? b64 : `data:image/jpeg;base64,${b64}`
-          }
-        });
-        attachedFrameIds.add(frame.frameId);
-      }
+      if (!b64) continue;
+      userContent.push({ type: "text", text: `FRAME ${frame.frameId} @ ${frame.timestamp.toFixed(1)}s` });
+      userContent.push({ type: "image_url", image_url: { url: b64.startsWith("data:") ? b64 : `data:image/jpeg;base64,${b64}` } });
+      attached.add(frame.frameId);
     }
 
     const messages = [
-      { role: "system", content: systemPrompt },
+      { role: "system", content: SEMANTIC_EXTRACTION_PROMPT },
       { role: "user", content: userContent }
     ];
 
-    const rawJson = await this.executeChatCompletion(this.visionModel, messages);
-    const cleaned = cleanJsonPayload(rawJson);
+    const completion = await this.executeVisionCompletion(messages);
+    if (completion.finishReason === "length") {
+      throw new OpenRouterError(
+        "OUTPUT_TRUNCATED",
+        `Model output was cut off at the token limit (model ${completion.model}); the action list would be incomplete. Reduce the segment size and retry.`
+      );
+    }
+    return this.parseWithGuardedRepair(completion.content, SemanticActionsResultSchema, "semantic actions");
+  }
 
+  /**
+   * One syntax-only repair attempt. A repaired result may not contain more actions than the
+   * original text did, so the repair cannot introduce steps the vision model never produced.
+   */
+  private async parseWithGuardedRepair<T extends { semanticActions?: unknown[] }>(raw: string, schema: { parse(v: unknown): T }, label: string): Promise<T> {
+    const cleaned = cleanJsonPayload(raw);
     try {
-      const parsed = JSON.parse(cleaned);
-      return SemanticActionsResultSchema.parse(parsed);
+      return schema.parse(JSON.parse(cleaned));
     } catch (parseErr: any) {
-      logger.warn({ parseErr: parseErr.message, rawText: rawJson.slice(0, 200) }, "[OpenRouter] JSON parse failed, attempting controlled repair");
-      // Controlled single repair attempt
-      const repairPrompt = `The previous JSON response contained syntax errors or schema violations. Fix and output valid JSON conforming exactly to the requested schema. Do not include markdown code fences or conversational text.`;
+      logger.warn({ parseErr: parseErr.message, rawText: raw.slice(0, 200) }, `[OpenRouter] ${label} JSON invalid; attempting syntax-only repair`);
+      const maxActions = countActionObjects(cleaned);
       const repaired = await this.executeChatCompletion(this.reasoningModel, [
-        { role: "system", content: repairPrompt },
-        { role: "user", content: `Broken JSON:\n${cleaned}` }
+        { role: "system", content: "Fix only the JSON syntax of the user's text so it parses. Do not add, remove, reorder or rewrite any items or values. Output JSON only, without code fences." },
+        { role: "user", content: cleaned }
       ]);
-      const repairedClean = cleanJsonPayload(repaired);
       try {
-        const parsedRepaired = JSON.parse(repairedClean);
-        return SemanticActionsResultSchema.parse(parsedRepaired);
+        const parsed = schema.parse(JSON.parse(cleanJsonPayload(repaired.content)));
+        if (Array.isArray(parsed.semanticActions) && parsed.semanticActions.length > maxActions) {
+          throw new Error(`repair produced ${parsed.semanticActions.length} actions from text containing ${maxActions}`);
+        }
+        return parsed;
       } catch (finalErr: any) {
-        throw new OpenRouterError("MALFORMED_OUTPUT", `OpenRouter output failed schema validation: ${finalErr.message}`);
+        throw new OpenRouterError("MALFORMED_OUTPUT", `OpenRouter ${label} failed schema validation: ${finalErr.message}`);
       }
     }
   }
@@ -345,99 +386,47 @@ CRITICAL TASK RULES:
     semanticActions: SemanticAction[],
     context: ProcessReasoningContext
   ): Promise<ProcessUnderstandingResult> {
-    const systemPrompt = `You are an expert business process architect compiling higher-level process intelligence from validated semantic actions.
+    const systemPrompt = `You summarise a demonstrated process from an ordered list of actions that were already extracted from a recording.
 
-COMPILATION INSTRUCTIONS:
-1. Keep ONLY task-relevant actions.
-2. Remove:
-   - Browser chrome interactions
-   - Inactive tabs
-   - Redundant clicks or micro-adjustments
-   - Duplicate waits
-3. Generalize literal values into reusable variables where evidence supports it (e.g., turn specific item name into product variable, specific credentials into auth variables).
-4. Identify process structure:
-   - LINEAR: Standard sequence
-   - LOOP: Repeated operations over datasets
-   - CONDITIONAL: Alternate branches based on state
-5. Extract business rules and exception handling:
-   - Identify trigger conditions (e.g. "If redirected to login due to unauthorized session")
-   - Identify fallback actions (e.g. "Re-authenticate using standard credentials")
-6. Mark uncertainty explicitly.
+Rules:
+1. Do not add, remove or reorder actions. Describe only what the listed actions accomplish.
+2. Generalise a literal value into a variable only when the actions show it is data that changes between runs; otherwise keep it as a constant.
+3. Report a LOOP or CONDITIONAL structure only if the actions show a repetition or an alternative branch.
+4. Business rules and exceptions must come from the actions or the user's stated objective. If there are none, return empty lists.
+5. If the goal is not evident, leave taskIntent empty.
 
-OUTPUT FORMAT:
-Return strict, cleanly structured JSON only:
+Return strict JSON only:
 {
-  "taskIntent": "Concise description of the overall business process being performed",
+  "taskIntent": "",
   "applicationEnvironment": "Web Browser | Windows Desktop | Mixed",
-  "processStructure": {
-    "type": "LINEAR | LOOP | CONDITIONAL",
-    "stepIndices": [0, 1, 2, 3]
-  },
-  "variables": [
-    {
-      "name": "variable_name",
-      "type": "string | number | boolean | date",
-      "classification": "CONSTANT | EXAMPLE_VALUE | RUNTIME_VARIABLE | EXTRACTED_VALUE | DERIVED_VALUE",
-      "semanticRole": "credential | order_id | search_query | etc.",
-      "defaultValue": "example string"
-    }
-  ],
-  "businessRules": [
-    {
-      "rule": "Rule description",
-      "confidence": 0.95,
-      "reasoning": "Reason for rule"
-    }
-  ],
-  "expectedOutcomes": [
-    "What the completed state should verify"
-  ],
-  "exceptions": [
-    {
-      "triggerCondition": "Condition that causes a branch or failure",
-      "fallbackAction": "Exact recovery step"
-    }
-  ],
-  "confidence": 0.95
+  "processStructure": { "type": "LINEAR | LOOP | CONDITIONAL", "stepIndices": [] },
+  "variables": [ { "name": "", "type": "string | number | boolean | date", "classification": "CONSTANT | EXAMPLE_VALUE | RUNTIME_VARIABLE | EXTRACTED_VALUE | DERIVED_VALUE", "semanticRole": "", "defaultValue": "" } ],
+  "businessRules": [ { "rule": "", "confidence": 0.0, "reasoning": "" } ],
+  "expectedOutcomes": [],
+  "exceptions": [ { "triggerCondition": "", "fallbackAction": "" } ],
+  "confidence": 0.0
 }`;
 
     const userPayload = {
-      taskObjective: context.objective || "Reconstruct demonstrated business workflow",
+      taskObjective: context.objective || "",
       semanticActions,
       existingVariables: context.variables || [],
       knownUncertainties: context.uncertainties || []
     };
 
-    const messages = [
+    const completion = await this.executeChatCompletion(this.reasoningModel, [
       { role: "system", content: systemPrompt },
       { role: "user", content: JSON.stringify(userPayload, null, 2) }
-    ];
-
-    const rawJson = await this.executeChatCompletion(this.reasoningModel, messages);
-    const cleaned = cleanJsonPayload(rawJson);
-
-    try {
-      const parsed = JSON.parse(cleaned);
-      return ProcessUnderstandingResultSchema.parse(parsed);
-    } catch (parseErr: any) {
-      logger.warn({ parseErr: parseErr.message }, "[OpenRouter] Process JSON parse failed, attempting controlled repair");
-      const repairPrompt = `Fix and output valid JSON conforming exactly to the ProcessUnderstandingResult schema. Return strict JSON only.`;
-      const repaired = await this.executeChatCompletion(this.reasoningModel, [
-        { role: "system", content: repairPrompt },
-        { role: "user", content: `Broken JSON:\n${cleaned}` }
-      ]);
-      const repairedClean = cleanJsonPayload(repaired);
-      try {
-        const parsedRepaired = JSON.parse(repairedClean);
-        return ProcessUnderstandingResultSchema.parse(parsedRepaired);
-      } catch (finalErr: any) {
-        throw new OpenRouterError("MALFORMED_OUTPUT", `OpenRouter process compilation failed validation: ${finalErr.message}`);
-      }
+    ]);
+    if (completion.finishReason === "length") {
+      throw new OpenRouterError("OUTPUT_TRUNCATED", `Process summary was cut off at the token limit (model ${completion.model}).`);
     }
+    return this.parseWithGuardedRepair(completion.content, ProcessUnderstandingResultSchema as any, "process understanding") as Promise<ProcessUnderstandingResult>;
   }
 
   /**
    * Optional OpenRouter Call #3 — Workflow Critic (Configurable, disabled by default).
+   * A critic that cannot be parsed is reported as not passed; it never passes by default.
    */
   public async critiqueWorkflow(workflow: any, evidence: SemanticEvidencePacket): Promise<CriticResult> {
     if (!this.config.enableWorkflowCritic) {
@@ -457,20 +446,20 @@ Verify:
 3. Are all variables grounded in evidence?
 Return JSON: { "passed": boolean, "unsupportedSteps": [], "hallucinatedVariables": [], "clutterDetected": [], "suggestions": [] }`;
 
-    const raw = await this.executeChatCompletion(this.reasoningModel, [
+    const completion = await this.executeChatCompletion(this.reasoningModel, [
       { role: "system", content: systemPrompt },
       { role: "user", content: JSON.stringify({ workflow, packetSummary: evidence.taskContext }, null, 2) }
     ]);
 
     try {
-      return JSON.parse(cleanJsonPayload(raw));
+      return JSON.parse(cleanJsonPayload(completion.content));
     } catch {
       return {
-        passed: true,
+        passed: false,
         unsupportedSteps: [],
         hallucinatedVariables: [],
         clutterDetected: [],
-        suggestions: []
+        suggestions: ["Critic response could not be parsed; the workflow was not independently reviewed."]
       };
     }
   }

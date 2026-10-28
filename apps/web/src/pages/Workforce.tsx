@@ -308,7 +308,8 @@ export function Workforce() {
     if (runningId) return;
     setRunningId(workerId);
     try {
-      const res = await api.runWorker(workerId);
+      const worker = workers.find((item) => item.id === workerId);
+      const res = await api.runWorker(workerId, worker?.activeVersionId, worker?.trainingSource?.jobId || worker?.recordingId);
       const targetWorkerId = res?.workerId || workerId;
       navigate(`/workers/${targetWorkerId}`, { state: { activeRunId: res?.run?.id } });
     } catch (err: any) {

@@ -30,6 +30,7 @@ async function main() {
   await testModel("meta-llama/llama-3.3-70b-instruct:free");
   await testModel("mistralai/mistral-small-24b-instruct-2501:free");
   await testModel("nvidia/nemotron-3.5-super-vl:free");
+  await testModel("dots-studio/dots-3-note-preview:free");
 }
 
 main();

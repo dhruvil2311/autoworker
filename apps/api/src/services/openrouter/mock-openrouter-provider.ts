@@ -28,7 +28,8 @@ export class MockVisionProvider implements VisionReasoningProvider {
     if (this.customSemanticActions) {
       return {
         semanticActions: this.customSemanticActions,
-        discardedNoise: ["mock_ignored_taskbar", "mock_ignored_inactive_tab"]
+        discardedNoise: ["mock_ignored_taskbar", "mock_ignored_inactive_tab"],
+        unresolved: []
       };
     }
 
@@ -45,7 +46,8 @@ export class MockVisionProvider implements VisionReasoningProvider {
 
     return {
       semanticActions: actions,
-      discardedNoise: ["static_wallpaper", "inactive_tab_gmail", "taskbar_clock"]
+      discardedNoise: ["static_wallpaper", "inactive_tab_gmail", "taskbar_clock"],
+      unresolved: []
     };
   }
 

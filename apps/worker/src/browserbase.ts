@@ -100,7 +100,7 @@ export class BrowserbaseExecutionProvider {
 
   async cleanup(browser: Awaited<ReturnType<BrowserbaseExecutionProvider["connectBrowser"]>>) {
     if (process.env.KEEP_BROWSER_OPEN === "true") {
-      console.log("SauceDemo execution complete — browser left open for inspection.");
+      console.log("Execution complete — browser left open for inspection (KEEP_BROWSER_OPEN=true).");
       return; // Do not close
     }
     await browser.close();

@@ -28,7 +28,8 @@ export class EvidenceEpisodeBuilder {
       if (!obs) continue;
 
       const episodeId = `ep_${(i + 1).toString().padStart(2, "0")}`;
-      const actionTime = obs.timestamp || (i * 1.5);
+      // A missing timestamp is not invented; the episode is anchored to its neighbours' frames instead.
+      const actionTime = typeof obs.timestamp === "number" && Number.isFinite(obs.timestamp) ? obs.timestamp : (frames[0]?.timestamp ?? 0);
       const startTime = Math.max(0, actionTime - 0.75);
       const endTime = actionTime + 0.75;
 
@@ -38,9 +39,9 @@ export class EvidenceEpisodeBuilder {
 
       // Associate OCR facts within time window
       const beforeOcr = ocrFacts.filter(o => (o.timestamp ?? 0) <= actionTime).slice(-10);
-      const afterOcr = ocrFacts.filter(o => (o.timestamp ?? 0) > actionTime && (o.timestamp ?? 0) <= endTime + 1.0).slice(0, 10);
+      const afterOcr = ocrFacts.filter(o => (o.timestamp ?? 0) > actionTime && (o.timestamp ?? 0) <= endTime + 1.0).slice(0, 20);
 
-      let actionType: EvidenceEpisode["action"]["type"] = "CLICK";
+      let actionType: EvidenceEpisode["action"]["type"] = obs.isClickTarget || /click/i.test(obs.type || "") ? "CLICK" : "UNKNOWN";
       if (obs.type === "TYPE" || obs.isTextMutation || obs.value) {
         actionType = "TYPE";
       } else if (obs.type === "NAVIGATE" || (obs.targetText && obs.targetText.startsWith("http"))) {
@@ -65,7 +66,7 @@ export class EvidenceEpisodeBuilder {
           coordinates: obs.coordinates,
           value: obs.value,
           source: obs.isClickTarget ? "cursor-analysis" : (obs.isTextMutation ? "ocr-mutation" : "inferred"),
-          confidence: 0.90
+          confidence: typeof obs.confidence === "number" ? obs.confidence : 0.5
         },
         after: {
           frames: afterFrames.length ? afterFrames : (beforeFrames.length ? beforeFrames : frames.slice(-1)),
@@ -98,13 +99,13 @@ export class EvidenceEpisodeBuilder {
         application: context.activeApp || "Browser",
         before: {
           frames: [beforeFrame],
-          ocr: []
+          ocr: ocrFacts.filter(o => o.frameId === beforeFrame.frameId || o.timestamp === beforeFrame.timestamp)
         },
+        // A visual change between two frames shows that something happened, not what was clicked.
         action: {
-          type: "CLICK",
-          targetText: afterOcr[0]?.text || "Demonstrated UI Interaction",
+          type: "UNKNOWN",
           source: "inferred",
-          confidence: 0.85
+          confidence: 0.3
         },
         after: {
           frames: [afterFrame],
@@ -131,9 +132,23 @@ export class EvidenceEpisodeBuilder {
       taskContext: context.taskContext || "User demonstration execution",
       activeApplication: context.activeApp || episodes[0]?.application || "Browser",
       episodes,
-      ocrFacts: ocrFacts.slice(0, 50).map(o => o.text),
+      ocrFacts: dedupeOcr(ocrFacts).map(o => o.text),
+      timedOcr: dedupeOcr(ocrFacts),
       confidence: 0.92,
       timestamps: { start: startTime, end: endTime }
     };
   }
+}
+
+/** Keeps the first occurrence of each OCR line across the timeline so later text is not crowded out. */
+export function dedupeOcr(ocrFacts: OcrFact[]): Array<{ text: string; timestamp?: number | undefined; frameId?: string | undefined }> {
+  const seen = new Set<string>();
+  const out: Array<{ text: string; timestamp?: number | undefined; frameId?: string | undefined }> = [];
+  for (const fact of [...ocrFacts].sort((a, b) => (a.timestamp ?? 0) - (b.timestamp ?? 0))) {
+    const key = String(fact.text || "").trim().toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push({ text: fact.text.trim(), timestamp: fact.timestamp, frameId: fact.frameId });
+  }
+  return out;
 }

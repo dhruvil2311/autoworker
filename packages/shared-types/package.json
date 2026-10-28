@@ -8,6 +8,10 @@
     ".": {
       "types": "./src/index.ts",
       "import": "./src/index.ts"
+    },
+    "./contracts": {
+      "types": "./src/contracts.ts",
+      "import": "./src/contracts.ts"
     }
   },
   "scripts": {
@@ -15,7 +19,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@ghost/workflow-schema": "0.1.0"
+    "@ghost/workflow-schema": "0.1.0",
+    "zod": "^4.5.4"
   },
   "devDependencies": {
     "typescript": "^5.7.2"

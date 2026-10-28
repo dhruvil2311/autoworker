@@ -98,14 +98,16 @@ class DeterministicSemanticReasoningProvider(SemanticReasoningProvider):
                 "action_type": "NAVIGATE",
                 "application": "Browser",
                 "target_description": f"Open {detected_url}",
-                "target_selector": {"strategy": "CSS", "selector": "body"},
+                "target_selector": {"strategy": "URL", "url": detected_url},
                 "parameters": {"url": detected_url, "application": "Browser"},
                 "summary": f"Open {detected_url}",
                 "start_timestamp": 0.0,
                 "end_timestamp": 1.0,
-                "confidence": 0.95,
-                "evidence_status": "OBSERVED",
-                "provenance": {"frame_ids": [states[0].frame_id] if states else ["frame_000000"]}
+                "confidence": 0.7,
+                # The URL is read from on-screen text; the act of navigating is inferred, not observed.
+                "evidence_status": "INFERRED",
+                "inference_status": "INFERRED",
+                "provenance": {"frame_ids": [states[0].frame_id] if states else [], "rationale": "Destination inferred from the most frequent URL in on-screen text"}
             })
 
         # 4. Synthesize Granular Operational Actions from Raw Video Evidence

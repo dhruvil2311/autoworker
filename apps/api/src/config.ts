@@ -45,6 +45,10 @@ const configSchema = z.object({
   allowPaidModels: z.boolean().default(false),
   openRouterMaxConcurrentRequests: z.coerce.number().int().positive().default(1),
   openRouterMaxRetries: z.coerce.number().int().nonnegative().default(1),
+  // Vision-capable models to try when the primary vision model fails for a provider-side reason.
+  // Only models listed here are used; nothing is substituted implicitly.
+  openRouterFallbackVisionModels: z.array(z.string()).default([]),
+  openRouterRequestTimeoutMs: z.coerce.number().int().positive().default(60_000),
   maxLlmImagesPerRequest: z.coerce.number().int().positive().default(6),
   maxLlmImagesTotal: z.coerce.number().int().positive().default(120),
   videoSampleFps: z.coerce.number().positive().default(1),
@@ -88,6 +92,8 @@ export function loadConfig(env = process.env): ApiConfig {
   const allowPaidModels = mergedEnv.ALLOW_PAID_MODELS === "true";
   const openRouterMaxConcurrentRequests = mergedEnv.OPENROUTER_MAX_CONCURRENT_REQUESTS ? Number(mergedEnv.OPENROUTER_MAX_CONCURRENT_REQUESTS) : 1;
   const openRouterMaxRetries = mergedEnv.OPENROUTER_MAX_RETRIES ? Number(mergedEnv.OPENROUTER_MAX_RETRIES) : 1;
+  const openRouterFallbackVisionModels = (mergedEnv.OPENROUTER_FALLBACK_VISION_MODELS || "").split(",").map(m => m.trim()).filter(Boolean);
+  const openRouterRequestTimeoutMs = mergedEnv.OPENROUTER_REQUEST_TIMEOUT_MS ? Number(mergedEnv.OPENROUTER_REQUEST_TIMEOUT_MS) : 60_000;
   const maxLlmImagesPerRequest = mergedEnv.MAX_LLM_IMAGES_PER_REQUEST ? Number(mergedEnv.MAX_LLM_IMAGES_PER_REQUEST) : 6;
   const maxLlmImagesTotal = mergedEnv.MAX_LLM_IMAGES_TOTAL ? Number(mergedEnv.MAX_LLM_IMAGES_TOTAL) : 120;
   const videoSampleFps = mergedEnv.VIDEO_SAMPLE_FPS ? Number(mergedEnv.VIDEO_SAMPLE_FPS) : 1;
@@ -142,6 +148,8 @@ export function loadConfig(env = process.env): ApiConfig {
     allowPaidModels,
     openRouterMaxConcurrentRequests,
     openRouterMaxRetries,
+    openRouterFallbackVisionModels,
+    openRouterRequestTimeoutMs,
     maxLlmImagesPerRequest,
     maxLlmImagesTotal,
     videoSampleFps,

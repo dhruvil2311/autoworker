@@ -4,12 +4,19 @@ import * as fs from "fs";
 import { fileURLToPath } from "url";
 import { logger } from "@ghost/observability";
 import type { NormalizedDemonstration, Observation } from "@ghost/bpi";
+import { specificSelectorOnly } from "@ghost/workflow-schema";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 export interface DesktopAnalysisJob {
   jobId: string;
+  tenantId?: string | undefined;
+  workerId?: string | undefined;
+  /** Upload document this job analyses, and the SHA-256 of its exact bytes. */
+  documentId?: string | undefined;
+  contentSha256?: string | undefined;
+  outputDir?: string | undefined;
   status: "QUEUED" | "RUNNING" | "EXTRACTING" | "OCR" | "UNDERSTANDING" | "BUILDING_TIMELINE" | "BUILDING_WORKFLOW" | "NEEDS_CLARIFICATION" | "COMPLETED" | "FAILED";
   progressPercent: number;
   currentStage: string;
@@ -21,9 +28,31 @@ export interface DesktopAnalysisJob {
   completedAt?: string;
 }
 
+/** Upper bound on one local analysis; a hung analyser fails the job instead of leaving it RUNNING. */
+const ANALYSIS_TIMEOUT_MS = Number(process.env.EVIDENCE_ANALYSIS_TIMEOUT_MS || 15 * 60 * 1000);
+
+/** Text that belongs to the recording tool itself, matched as whole phrases only. */
+const RECORDER_CHROME = [
+  /\bstop sharing\b/i, /\bstop recording\b/i, /\bis sharing your screen\b/i,
+  /localhost:5173/i, /localhost:4000/i, /\bteaching workspace\b/i
+];
+
 export class DesktopEvidenceBridge {
   private static instance: DesktopEvidenceBridge;
   private jobs: Map<string, DesktopAnalysisJob> = new Map();
+
+  /** Persists job status beside its artefacts so a restart reports the truth instead of "not found". */
+  private persistJobState(job: DesktopAnalysisJob): void {
+    if (!job.outputDir) return;
+    try {
+      const dir = path.join(job.outputDir, job.jobId);
+      fs.mkdirSync(dir, { recursive: true });
+      const { result, ...rest } = job;
+      fs.writeFileSync(path.join(dir, "job.json"), JSON.stringify({ ...rest, updatedAt: new Date().toISOString() }, null, 2), "utf8");
+    } catch (err: any) {
+      logger.warn({ jobId: job.jobId, err: err.message }, "Could not persist evidence job state");
+    }
+  }
 
   private constructor() {}
 
@@ -72,7 +101,7 @@ export class DesktopEvidenceBridge {
     return new Promise((resolve, reject) => {
       const start = Date.now();
       const interval = setInterval(() => {
-        const currentJob = this.getJob(options.jobId);
+        const currentJob = this.getJob(options.jobId, options.tenantId);
         if (currentJob?.status === "COMPLETED") {
           clearInterval(interval);
           resolve(currentJob.result);
@@ -87,41 +116,62 @@ export class DesktopEvidenceBridge {
     });
   }
 
-  public getJob(jobId: string): DesktopAnalysisJob | undefined {
+  public getJob(jobId: string, tenantId: string): DesktopAnalysisJob | undefined {
     let job = this.jobs.get(jobId);
+    if (job && (job.tenantId || job.result?.tenant_id) !== tenantId) return undefined;
     if (!job) {
       // Check disk if server restarted
       const evidenceOutputDirs = [
-        path.resolve(process.cwd(), "evidence_output"),
-        path.resolve(process.cwd(), "apps/api/evidence_output"),
-        path.resolve(__dirname, "../../evidence_output"),
-        path.resolve(__dirname, "../../../evidence_output"),
+        path.resolve(process.cwd(), "evidence_output", tenantId),
+        path.resolve(process.cwd(), "apps/api/evidence_output", tenantId),
+        path.resolve(__dirname, "../../evidence_output", tenantId),
+        path.resolve(__dirname, "../../../evidence_output", tenantId),
       ];
 
       for (const baseDir of evidenceOutputDirs) {
         if (!fs.existsSync(baseDir)) continue;
         try {
-          const findJobJson = (dir: string): string | null => {
+          const findJobDir = (dir: string): string | null => {
             const entries = fs.readdirSync(dir, { withFileTypes: true });
             for (const entry of entries) {
               const fullPath = path.join(dir, entry.name);
               if (entry.isDirectory()) {
-                if (entry.name === jobId) {
-                  const target = path.join(fullPath, "analysis_result.json");
-                  if (fs.existsSync(target)) return target;
+                if (entry.name === jobId && (fs.existsSync(path.join(fullPath, "analysis_result.json")) || fs.existsSync(path.join(fullPath, "job.json")))) {
+                  return fullPath;
                 }
-                const sub = findJobJson(fullPath);
+                const sub = findJobDir(fullPath);
                 if (sub) return sub;
               }
             }
             return null;
           };
 
-          const foundFile = findJobJson(baseDir);
+          const jobDir = findJobDir(baseDir);
+          const stateFile = jobDir ? path.join(jobDir, "job.json") : null;
+          const persisted = stateFile && fs.existsSync(stateFile) ? JSON.parse(fs.readFileSync(stateFile, "utf-8")) : null;
+          if (persisted && persisted.tenantId !== tenantId) return undefined;
+          const foundFile = jobDir && fs.existsSync(path.join(jobDir, "analysis_result.json")) ? path.join(jobDir, "analysis_result.json") : null;
+          if (!foundFile && persisted) {
+            // The process that ran this job is gone; an unfinished job cannot still be running.
+            const unfinished = !["COMPLETED", "FAILED"].includes(persisted.status);
+            job = {
+              ...persisted,
+              status: unfinished ? "FAILED" : persisted.status,
+              error: unfinished ? "Analysis was interrupted by a service restart. Start the analysis again." : persisted.error
+            } as DesktopAnalysisJob;
+            this.jobs.set(jobId, job!);
+            return job;
+          }
           if (foundFile) {
             const data = JSON.parse(fs.readFileSync(foundFile, "utf-8"));
+            if (data.tenant_id !== tenantId) return undefined;
             job = {
               jobId,
+              tenantId,
+              workerId: data.worker_id || data.asset?.worker_id || persisted?.workerId,
+              documentId: persisted?.documentId,
+              contentSha256: persisted?.contentSha256,
+              outputDir: persisted?.outputDir,
               status: "COMPLETED",
               progressPercent: 100,
               currentStage: "COMPLETE",
@@ -140,64 +190,35 @@ export class DesktopEvidenceBridge {
     return job;
   }
 
-  public findJobIdForMedia(mediaPath: string): string | undefined {
-    // 1. Check in-memory jobs
+  /**
+   * Finds a completed analysis of exactly these bytes for this tenant and worker. Identity is the
+   * content hash, never the file name, so a different video with the same name is analysed afresh.
+   */
+  public findCompletedJobForContent(contentSha256: string, tenantId: string, workerId: string): DesktopAnalysisJob | undefined {
     for (const job of this.jobs.values()) {
-      if (job.mediaPath === mediaPath && job.status === "COMPLETED") {
-        return job.jobId;
+      if (job.status === "COMPLETED" && job.contentSha256 === contentSha256 && job.tenantId === tenantId && job.workerId === workerId) {
+        return job;
       }
     }
-
-    // 2. Check disk output directories
-    const evidenceOutputDirs = [
-      path.resolve(process.cwd(), "evidence_output"),
-      path.resolve(process.cwd(), "apps/api/evidence_output"),
-      path.resolve(__dirname, "../../evidence_output"),
-      path.resolve(__dirname, "../../../evidence_output"),
+    const baseDirs = [
+      path.resolve(process.cwd(), "evidence_output", tenantId, workerId),
+      path.resolve(process.cwd(), "apps/api/evidence_output", tenantId, workerId)
     ];
-
-    const baseName = path.basename(mediaPath);
-    for (const baseDir of evidenceOutputDirs) {
+    for (const baseDir of baseDirs) {
       if (!fs.existsSync(baseDir)) continue;
-      try {
-        const findJob = (dir: string): string | null => {
-          const entries = fs.readdirSync(dir, { withFileTypes: true });
-          for (const entry of entries) {
-            const fullPath = path.join(dir, entry.name);
-            if (entry.isDirectory()) {
-              const target = path.join(fullPath, "analysis_result.json");
-              if (fs.existsSync(target)) {
-                try {
-                  const data = JSON.parse(fs.readFileSync(target, "utf-8"));
-                  if (data.asset?.file_path === mediaPath || data.asset?.file_name === baseName) {
-                    const actions = data.semantic_actions || [];
-                    const hasCorruption = actions.some((a: any) => {
-                      const val = String(a.parameters?.value || "");
-                      const desc = String(a.summary || "");
-                      return val.includes("TextRegion_") || desc.includes("TextRegion_");
-                    });
-                    if (!hasCorruption && actions.length <= 35) {
-                      return entry.name;
-                    }
-                  }
-                } catch {}
-              }
-              const sub = findJob(fullPath);
-              if (sub) return sub;
-            }
+      for (const entry of fs.readdirSync(baseDir, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const stateFile = path.join(baseDir, entry.name, "job.json");
+        if (!fs.existsSync(stateFile)) continue;
+        try {
+          const persisted = JSON.parse(fs.readFileSync(stateFile, "utf-8"));
+          if (persisted.contentSha256 === contentSha256 && persisted.tenantId === tenantId && persisted.workerId === workerId && persisted.status === "COMPLETED") {
+            const job = this.getJob(persisted.jobId, tenantId);
+            if (job?.status === "COMPLETED") return job;
           }
-          return null;
-        };
-
-        const foundJobId = findJob(baseDir);
-        if (foundJobId) {
-          // Hydrate into in-memory jobs
-          this.getJob(foundJobId);
-          return foundJobId;
-        }
-      } catch {}
+        } catch { /* Ignore unreadable state files. */ }
+      }
     }
-
     return undefined;
   }
 
@@ -267,6 +288,7 @@ export class DesktopEvidenceBridge {
     job.progressPercent = 0;
     job.error = reason || "Desktop evidence analysis failed. No fake workflow generated.";
     job.completedAt = new Date().toISOString();
+    this.persistJobState(job);
     return null;
   }
 
@@ -279,6 +301,8 @@ export class DesktopEvidenceBridge {
     outputDir: string;
     tenantId: string;
     workerId?: string;
+    documentId?: string;
+    contentSha256?: string;
   }): Promise<DesktopAnalysisJob> {
     const { jobId, mediaPath, outputDir, tenantId, workerId } = options;
 
@@ -291,14 +315,20 @@ export class DesktopEvidenceBridge {
 
     const job: DesktopAnalysisJob = {
       jobId,
+      tenantId,
+      workerId,
       status: "QUEUED",
       progressPercent: 5,
       currentStage: "Media Ingestion Initialized",
       mediaPath,
       mediaType,
+      documentId: options.documentId,
+      contentSha256: options.contentSha256,
+      outputDir,
       createdAt: new Date().toISOString(),
     };
     this.jobs.set(jobId, job);
+    this.persistJobState(job);
 
     // Asynchronously run analysis
     setImmediate(async () => {
@@ -306,6 +336,7 @@ export class DesktopEvidenceBridge {
         job.status = "RUNNING";
         job.currentStage = "EXTRACTING";
         job.progressPercent = 20;
+        this.persistJobState(job);
 
         const pythonPackageDir = this.resolvePackageDir();
         const pythonCmd = this.resolvePythonCommand();
@@ -324,6 +355,7 @@ export class DesktopEvidenceBridge {
 
         let processFinished = false;
         let pythonProcess: any;
+        let timeoutHandle: NodeJS.Timeout | undefined;
 
         try {
           const isAbsolute = path.isAbsolute(pythonCmd);
@@ -340,6 +372,15 @@ export class DesktopEvidenceBridge {
           this.generateFallbackAnalysis(job, mediaPath, outputDir, tenantId, workerId, spawnErr.message);
           return;
         }
+
+        timeoutHandle = setTimeout(() => {
+          if (processFinished) return;
+          processFinished = true;
+          try { pythonProcess.kill(); } catch { /* already exited */ }
+          this.generateFallbackAnalysis(job, mediaPath, outputDir, tenantId, workerId, `Analysis exceeded ${Math.round(ANALYSIS_TIMEOUT_MS / 60000)} minutes and was stopped.`);
+        }, ANALYSIS_TIMEOUT_MS);
+        // The watchdog must not keep the process alive on its own.
+        timeoutHandle.unref?.();
 
         // CRITICAL: Handle error event immediately to prevent unhandled 'error' event crash
         pythonProcess.on("error", (err: any) => {
@@ -388,6 +429,7 @@ export class DesktopEvidenceBridge {
         }
 
         pythonProcess.on("close", (code: number) => {
+          if (timeoutHandle) clearTimeout(timeoutHandle);
           if (processFinished) return;
           processFinished = true;
 
@@ -401,6 +443,7 @@ export class DesktopEvidenceBridge {
               job.progressPercent = 100;
               job.result = data;
               job.completedAt = new Date().toISOString();
+              this.persistJobState(job);
               logger.info(
                 { jobId, actionCount: data.semantic_actions?.length, framesCount: data.frames?.length },
                 "Desktop evidence analysis completed and loaded from disk artifact"
@@ -419,6 +462,7 @@ export class DesktopEvidenceBridge {
               job.progressPercent = 100;
               job.result = parsedResult;
               job.completedAt = new Date().toISOString();
+              this.persistJobState(job);
               logger.info({ jobId }, "Desktop evidence analysis parsed from stdout");
               return;
             } catch (parseErr: any) {
@@ -448,9 +492,36 @@ export class DesktopEvidenceBridge {
   ): NormalizedDemonstration {
     const mediaName = String(analysisResult.asset?.file_name || analysisResult.mediaPath || "").toLowerCase();
     const taskIntent = String(analysisResult.process_understanding?.task_intent || "").toLowerCase();
-    const rawDetectedUrl = analysisResult.process_understanding?.detected_url ||
+    let rawDetectedUrl = analysisResult.process_understanding?.detected_url ||
       analysisResult.timeline?.states?.find((s: any) => s.browser_url && !String(s.browser_url).includes("localhost:5173") && !String(s.browser_url).includes("sharing"))?.browser_url ||
       null;
+    // Reconcile model-generated URL with screen OCR. OCR preserves subdomains that local CV
+    // summaries sometimes truncate (for example docs.google.com -> google.com).
+    const ocrUrls: string[] = [];
+    for (const state of analysisResult.timeline?.states || []) {
+      for (const text of state.visible_texts || []) {
+        if (typeof text !== "string") continue;
+        const matches = text.match(/(?:https?:\/\/)?(?:[a-z0-9-]+\.)+[a-z]{2,}(?::\d+)?(?:\/[a-z0-9._~:/?#[\]@!$&'()*+,;=%-]*)?/ig) || [];
+        for (const match of matches) {
+          try {
+            const url = new URL(/^https?:\/\//i.test(match) ? match : `https://${match.replace(/[.,;:!?)]+$/g, "")}`);
+            if (url.hostname.includes(".")) ocrUrls.push(url.toString().replace(/\/$/, ""));
+          } catch { /* Ignore incomplete OCR fragments. */ }
+        }
+      }
+    }
+    const mostSpecificOcrUrl = ocrUrls.sort((a, b) => {
+      const ua = new URL(a);
+      const ub = new URL(b);
+      return (ub.hostname.split(".").length * 10_000 + ub.pathname.length) - (ua.hostname.split(".").length * 10_000 + ua.pathname.length);
+    })[0];
+    if (mostSpecificOcrUrl) {
+      let currentHostDepth = 0;
+      try {
+        if (rawDetectedUrl) currentHostDepth = new URL(/^https?:\/\//i.test(rawDetectedUrl) ? rawDetectedUrl : `https://${rawDetectedUrl}`).hostname.split(".").length;
+      } catch { currentHostDepth = 0; }
+      if (!rawDetectedUrl || new URL(mostSpecificOcrUrl).hostname.split(".").length > currentHostDepth) rawDetectedUrl = mostSpecificOcrUrl;
+    }
     const detectedUrl = (rawDetectedUrl && !rawDetectedUrl.includes("localhost:5173") && !rawDetectedUrl.includes("sharing")) ? rawDetectedUrl : null;
 
     const isWebDemonstration = Boolean(detectedUrl) ||
@@ -458,42 +529,43 @@ export class DesktopEvidenceBridge {
       taskIntent.includes("browser") || taskIntent.includes("web") ||
       analysisResult.timeline?.applications_detected?.includes("Browser");
 
-    // General demonstration consolidation: filter layout bounding boxes, recorder noise, and merge micro-actions
-    const RECORDER_NOISE = [
-      "stop sharing", "stop recording", "is sharing your screen", "hide",
-      "autoworker", "localhost:5173", "localhost:4000", "teaching workspace",
-      "new tab", "what is ffmpeg", "roadmap", "spatial floor", "chatgpt", "command room"
-    ];
-    const filteredActions: any[] = (analysisResult.semantic_actions || []).filter((act: any) => {
-      const val = String(act.parameters?.value || act.parameters?.demonstrated_value || "").toLowerCase();
-      const desc = String(act.summary || act.target_description || "").toLowerCase();
-      const win = String(act.window_title || "").toLowerCase();
-      if (val.includes("textregion_") || val.startsWith("[textregion_")) return false;
-      if (desc.includes("textregion_") || desc.includes("[textregion_")) return false;
-      if (RECORDER_NOISE.some(rn => val.includes(rn) || desc.includes(rn) || win.includes(rn))) return false;
+    // Layout artefacts and recording-tool chrome are removed; every removal is recorded with its reason.
+    const droppedActions: Array<{ index: number; summary: string; reason: string }> = [];
+    const filteredActions: any[] = (analysisResult.semantic_actions || []).filter((act: any, index: number) => {
+      const val = String(act.parameters?.value || act.parameters?.demonstrated_value || "");
+      const desc = String(act.summary || act.target_description || "");
+      const win = String(act.window_title || "");
+      const summary = desc || act.action_type || "action";
+      if (/textregion_/i.test(val) || /textregion_/i.test(desc)) {
+        droppedActions.push({ index, summary, reason: "CV layout artefact, not a user action" });
+        return false;
+      }
+      if (RECORDER_CHROME.some(re => re.test(val) || re.test(desc) || re.test(win))) {
+        droppedActions.push({ index, summary, reason: "Interaction with the recording tool, not the task" });
+        return false;
+      }
       return true;
     });
 
+    // Only consecutive edits of the same field are merged; repeated clicks are distinct actions.
     const consolidatedActions: any[] = [];
     for (const act of filteredActions) {
-      if (consolidatedActions.length > 0) {
-        const last = consolidatedActions[consolidatedActions.length - 1];
-        if (
-          (act.action_type === "ENTER_VALUE" || act.action_type === "TYPE") &&
-          (last.action_type === "ENTER_VALUE" || last.action_type === "TYPE") &&
-          (act.target_description === last.target_description || JSON.stringify(act.target_selector) === JSON.stringify(last.target_selector))
-        ) {
-          last.parameters = { ...last.parameters, ...act.parameters };
-          last.summary = act.summary;
-          continue;
-        }
-        if (act.action_type === "CLICK" && last.action_type === "CLICK" && act.summary === last.summary) {
-          continue;
-        }
+      const last = consolidatedActions[consolidatedActions.length - 1];
+      if (
+        last &&
+        (act.action_type === "ENTER_VALUE" || act.action_type === "TYPE") &&
+        (last.action_type === "ENTER_VALUE" || last.action_type === "TYPE") &&
+        act.target_description && act.target_description === last.target_description
+      ) {
+        last.parameters = { ...last.parameters, ...act.parameters };
+        last.summary = act.summary;
+        last.end_timestamp = act.end_timestamp ?? last.end_timestamp;
+        droppedActions.push({ index: -1, summary: act.summary, reason: "Merged into the preceding edit of the same field" });
+        continue;
       }
       consolidatedActions.push(act);
-      if (consolidatedActions.length >= 25) break; // Intelligent step ceiling
     }
+    (analysisResult as any).dropped_actions = droppedActions;
 
     const observations: Observation[] = consolidatedActions.map((act: any, idx: number) => {
       let appName = act.application || (isWebDemonstration ? "Browser" : "Desktop");
@@ -514,61 +586,19 @@ export class DesktopEvidenceBridge {
         bpiAction = "CLICK";
       }
 
-      // Derive smart selector for web elements dynamically from any demonstration
-      let resolvedSelector = act.target_selector?.selector || act.parameters?.selector;
-      if (!resolvedSelector && isWebDemonstration) {
-        const rawTarget = act.parameters?.field_label || act.parameters?.target_name || act.target_description || desc || "";
-        const clean = String(rawTarget).replace(/^(?:click|press|submit|select|open|add|type|enter|fill)\s+/i, '').replace(/["'\.\:;]/g, '').trim();
-        const lowerClean = clean.toLowerCase();
-        const slug = lowerClean.replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-
-        if (bpiAction === "INPUT") {
-          const inputCandidates: string[] = [];
-          if (slug) {
-            inputCandidates.push(
-              `input[name='${slug}']`,
-              `input[name*='${slug}' i]`,
-              `input[placeholder*='${clean}' i]`,
-              `input[aria-label*='${clean}' i]`,
-              `[data-test*='${slug}']`,
-              `#${slug}`
-            );
-          }
-          inputCandidates.push("input:not([type='hidden'])");
-          resolvedSelector = Array.from(new Set(inputCandidates.filter(Boolean))).join(", ");
-        } else if (bpiAction === "CLICK") {
-          const clickCandidates: string[] = [];
-          if (clean) {
-            clickCandidates.push(
-              `button:has-text('${clean}')`,
-              `a:has-text('${clean}')`,
-              `[role='button']:has-text('${clean}')`
-            );
-          }
-          if (slug) {
-            clickCandidates.push(
-              `[data-test*='${slug}']`,
-              `#${slug}`,
-              `button[name='${slug}']`,
-              `a[href*='${slug}']`
-            );
-            const words = clean.split(/\s+/).filter(w => w.length > 3 && !['click', 'item', 'button', 'into', 'from', 'view'].includes(w.toLowerCase()));
-            for (const w of words) {
-              const wSlug = w.toLowerCase().replace(/[^a-z0-9]+/g, '');
-              clickCandidates.push(`[data-test*='${wSlug}']`, `button:has-text('${w}')`, `a:has-text('${w}')`);
-            }
-          }
-          clickCandidates.push("button", "a");
-          resolvedSelector = Array.from(new Set(clickCandidates.filter(Boolean))).join(", ");
-        }
-      }
+      // A selector is used only when the evidence carried one; otherwise the step is targeted by its
+      // demonstrated label/text at run time. Generic catch-all selectors are never synthesised.
+      const evidenceSelector = act.target_selector?.strategy === "CSS" ? act.target_selector?.selector : (act.parameters?.selector || undefined);
+      const resolvedSelector = specificSelectorOnly(evidenceSelector);
+      const targetLabel = String(act.parameters?.field_label || act.parameters?.target_name || act.target_description || "")
+        .replace(/^(?:click(?: on)?|press|submit|select|open|type(?: into)?|enter(?: into)?|fill(?: in)?)\s+/i, "").trim();
 
       return {
         sequence: idx + 1,
-        timestamp: String(act.start_timestamp || idx),
+        timestamp: typeof act.start_timestamp === "number" ? String(act.start_timestamp) : "",
         action: bpiAction,
         context: {
-          url: act.parameters?.url || (isWebDemonstration ? (detectedUrl || "") : appName),
+          url: (bpiAction === "NAVIGATE" && detectedUrl) ? detectedUrl : (act.parameters?.url || (isWebDemonstration ? (detectedUrl || "") : appName)),
           page_title: desc,
           application: appName,
           window_title: act.window_title,
@@ -576,13 +606,13 @@ export class DesktopEvidenceBridge {
         target: {
           dom_evidence: {
             tag: isWebDemonstration ? "browser_element" : "desktop_control",
-            name: act.target_description,
+            name: targetLabel || undefined,
             role: act.action_type,
-            text: act.parameters?.target_name || act.target_description,
+            text: targetLabel || undefined,
             attributes: {
               application: appName,
               window_title: act.window_title || "",
-              selector: resolvedSelector || (isWebDemonstration ? "button, input, a" : JSON.stringify(act.target_selector || {})),
+              selector: resolvedSelector || (isWebDemonstration ? "" : JSON.stringify(act.target_selector || {})),
             },
           },
         },
@@ -620,65 +650,6 @@ export class DesktopEvidenceBridge {
         rationale: act.provenance?.rationale,
       } as any;
     });
-
-    // Ensure web demonstration starts with NAVIGATE if not already present
-    if (isWebDemonstration && detectedUrl && observations.length > 0 && observations[0]?.action !== "NAVIGATE") {
-      observations.unshift({
-        sequence: 1,
-        timestamp: "0.0",
-        action: "NAVIGATE",
-        context: {
-          url: detectedUrl,
-          page_title: `Open ${detectedUrl}`,
-          application: "Browser"
-        },
-        target: {
-          dom_evidence: {
-            tag: "body",
-            name: "Browser Navigation",
-            role: "NAVIGATE",
-            text: `Open ${detectedUrl}`,
-            attributes: {
-              selector: "body",
-              application: "Browser",
-              url: detectedUrl
-            }
-          }
-        },
-        application: "Browser",
-        action_type: "NAVIGATE",
-        inference_status: "OBSERVED"
-      } as any);
-      observations.forEach((o, i) => { o.sequence = i + 1; });
-    }
-
-    if (observations.length === 0) {
-      observations.push({
-        sequence: 1,
-        timestamp: "0.5",
-        action: isWebDemonstration ? "NAVIGATE" : "CLICK",
-        context: {
-          url: isWebDemonstration ? (detectedUrl || "about:blank") : "Desktop Application",
-          page_title: isWebDemonstration ? "Web Portal" : "Active Screen Interaction",
-          application: isWebDemonstration ? "Browser" : "Desktop",
-        },
-        target: {
-          dom_evidence: {
-            tag: isWebDemonstration ? "browser_navigation" : "desktop_control",
-            name: isWebDemonstration ? "Web Portal" : "Desktop Workspace Element",
-            role: isWebDemonstration ? "NAVIGATE" : "CLICK",
-            text: isWebDemonstration ? "Navigate to web portal" : "Demonstrated action on desktop workspace",
-            attributes: {
-              application: isWebDemonstration ? "Browser" : "Desktop",
-              selector: "body",
-            },
-          },
-        },
-        application: isWebDemonstration ? "Browser" : "Desktop",
-        action_type: isWebDemonstration ? "NAVIGATE" : "CLICK",
-        inference_status: "OBSERVED",
-      } as any);
-    }
 
     return {
       recording_id: analysisResult.media_id || `demo_${Date.now()}`,

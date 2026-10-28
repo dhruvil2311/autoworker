@@ -2,6 +2,7 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const visionCandidates = [
+  'dots-studio/dots-3-note-preview:free',
   'nvidia/nemotron-3.5-super-vl:free',
   'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
   'google/gemma-4-26b-a4b-it:free',

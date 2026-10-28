@@ -13,6 +13,7 @@ import { Register } from './pages/Register.js';
 
 import { BootstrapWrapper } from './components/BootstrapWrapper.js';
 import { AuthProvider, useAuth } from './components/AuthContext.js';
+import { PlatformApp } from './platform/PlatformApp.js';
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { session, loading } = useAuth();
@@ -42,6 +43,13 @@ export default function App() {
           <Route path="/login" element={<Login />} />
           <Route path="/register" element={<Register />} />
           
+          {/* Role-specific experiences: Workspace, Studio, Operations, Organization, Audit */}
+          <Route path="/app/*" element={
+            <ProtectedRoute>
+              <PlatformApp />
+            </ProtectedRoute>
+          } />
+
           {/* Dedicated Fullscreen Teaching Sandbox */}
           <Route path="/workers/:id/teach" element={
             <ProtectedRoute>
@@ -68,7 +76,7 @@ export default function App() {
                   <Route path="/settings" element={<Settings />} />
 
                   {/* Fallback to HQ */}
-                  <Route path="*" element={<Navigate to="/workforce" replace />} />
+                  <Route path="*" element={<Navigate to="/app" replace />} />
                 </Routes>
               </Layout>
             </ProtectedRoute>

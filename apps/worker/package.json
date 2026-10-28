@@ -7,7 +7,8 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run --passWithNoTests"
+    "test": "vitest run --passWithNoTests",
+    "test:e2e:platform": "vitest run --config vitest.e2e.config.ts"
   },
   "dependencies": {
     "@browserbasehq/sdk": "^2.16.0",

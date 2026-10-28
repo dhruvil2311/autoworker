@@ -42,6 +42,12 @@ import { hitlBus } from "./hitl-bus.js";
 
 // Lightweight HTTP server for instant execution triggers and live HITL resolutions
 const triggerServer = http.createServer((req, res) => {
+  if (req.method === "GET" && req.url === "/health") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true, activeRuns: activeRuns.size, pid: process.pid }));
+    return;
+  }
+
   if (req.method === "POST" && req.url?.startsWith("/trigger/")) {
     const runId = req.url.replace("/trigger/", "").trim();
     res.writeHead(202, { "Content-Type": "application/json" });

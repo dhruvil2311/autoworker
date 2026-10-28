@@ -121,7 +121,8 @@ export function HQPage() {
     if (runningId) return;
     setRunningId(workerId);
     try {
-      const res = await api.runWorker(workerId);
+      const worker = workers.find((item) => item.id === workerId);
+      const res = await api.runWorker(workerId, worker?.activeVersionId, worker?.trainingSource?.jobId || worker?.recordingId);
       navigate(`/workers/${workerId}`, { state: { activeRunId: res?.run?.id } });
     } catch (err: any) {
       alert(err.message || 'Execution failed to start.');

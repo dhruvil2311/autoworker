@@ -190,6 +190,7 @@ export * from "./v2.js";
 export * from "./semantic-operations.js";
 export * from "./language-translator.js";
 export * from "./desktop.js";
+export * from "./readiness.js";
 
 export function validateRecordingUpload(value: unknown): RecordingUpload {
   return recordingUploadSchema.parse(value);

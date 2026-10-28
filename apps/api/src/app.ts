@@ -4,7 +4,11 @@ import rateLimit from "express-rate-limit";
 import helmet from "helmet";
 // import { ZodError } from "zod";
 import { logger } from "@ghost/observability";
-import { validateRecordingUpload } from "@ghost/workflow-schema";
+import { validateRecordingUpload, assessExecutionReadiness } from "@ghost/workflow-schema";
+import { HitlDecisionError, type HitlDecisionInput } from "./run-state.js";
+import { requirePermission, hasPermission, canAccessRun } from "./authorization.js";
+import { createPlatformRouter } from "./routes/platform.js";
+import { computeRunControls, loadPolicies, runSummary, versionSummary, workflowLeaves } from "./services/platform-service.js";
 import { loadConfig, type ApiConfig } from "./config.js";
 import { createAuthMiddleware } from "./auth.js";
 import { requestId } from "./request-id.js";
@@ -55,6 +59,13 @@ export function formatHumanReadableGapQuestion(raw: any): { question: string; wh
     ? raw.suggested_question.suggested_options 
     : ["Retry automatically after 2s", "Pause for operator assistance (HITL)", "Apply standard default fallback"];
   return { question: q, why, options };
+}
+
+/** Records which worker a compiled version belongs to, so its version history can be listed. */
+function withWorker<T>(workflow: T, workerId: string): any {
+  const wf: any = workflow;
+  wf.compiler = { ...(wf.compiler || {}), worker_id: workerId };
+  return wf;
 }
 
 export function createApp(config: ApiConfig = loadConfig(), store: AppStore = createStore(config)) {
@@ -115,22 +126,22 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
 
   app.use("/api/v1/university", auth, universityRouter);
   app.use("/api/v1/desktop", auth, createDesktopRouter(store));
-  app.use("/api/v1/ghost-workers/:id/evidence", auth, createEvidenceRouter(config, store));
+  app.use("/api/v1/ghost-workers/:id/evidence", auth, requirePermission("workflows.build"), createEvidenceRouter(config, store));
 
-  app.post("/api/v1/recordings", auth, asyncHandler(async (req, res) => {
+  app.post("/api/v1/recordings", auth, requirePermission("workflows.build"), asyncHandler(async (req, res) => {
     const upload = validateRecordingUpload(req.body);
     const row = await store.createRecording(req.auth!, upload, req.header("idempotency-key") ?? undefined);
     logger.info({ recording_id: row.id, tenant_id: row.tenantId }, "recording_ingested");
     res.status(201).json({ recording_id: row.id, status: "PROCESSING" });
   }));
 
-  app.post("/api/v1/recordings/start", auth, asyncHandler(async (req, res) => {
+  app.post("/api/v1/recordings/start", auth, requirePermission("workflows.build"), asyncHandler(async (req, res) => {
     const row = await store.startRecording(req.auth!, { source: req.body?.source || "chrome_extension", metadata: req.body?.metadata }, req.header("idempotency-key") ?? undefined);
     logger.info({ recording_id: row.id, tenant_id: row.tenantId }, "recording_started");
     res.status(201).json({ recording_id: row.id });
   }));
 
-  app.post("/api/v1/recordings/:id/chunks", auth, asyncHandler(async (req, res) => {
+  app.post("/api/v1/recordings/:id/chunks", auth, requirePermission("workflows.build"), asyncHandler(async (req, res) => {
     const events = req.body?.events;
     if (!Array.isArray(events)) {
       res.status(400).json({ error: "Expected 'events' array in chunk" });
@@ -140,26 +151,26 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
     res.status(202).json({ ok: true, appended: events.length });
   }));
 
-  app.post("/api/v1/recordings/:id/finish", auth, asyncHandler(async (req, res) => {
+  app.post("/api/v1/recordings/:id/finish", auth, requirePermission("workflows.build"), asyncHandler(async (req, res) => {
     const endedAt = req.body?.ended_at ?? new Date().toISOString();
     const row = await store.finishRecording(req.auth!, param(req, "id"), endedAt);
     logger.info({ recording_id: row.id, tenant_id: row.tenantId }, "recording_finished");
     res.status(200).json({ recording_id: row.id, status: "PROCESSING" });
   }));
 
-  app.get("/api/v1/recordings", auth, asyncHandler(async (req, res) => {
+  app.get("/api/v1/recordings", auth, requirePermission("workflows.build"), asyncHandler(async (req, res) => {
     res.json({ recordings: await store.listRecordings(req.auth!) });
   }));
 
-  app.post("/api/v1/recordings/:id/compile", auth, asyncHandler(async (req, res) => {
+  app.post("/api/v1/recordings/:id/compile", auth, requirePermission("workflows.build"), asyncHandler(async (req, res) => {
     res.status(410).json({ error: { code: "GONE", message: "V1 compiler deprecated. Use BPI analyze endpoint." } });
   }));
 
-  app.get("/api/v1/workflows", auth, asyncHandler(async (req, res) => {
+  app.get("/api/v1/workflows", auth, requirePermission("workflows.build", "runs.view", "audit.read"), asyncHandler(async (req, res) => {
     res.json({ workflows: await store.listWorkflows(req.auth!) });
   }));
 
-  app.get("/api/v1/workflows/:versionId", auth, asyncHandler(async (req, res) => {
+  app.get("/api/v1/workflows/:versionId", auth, requirePermission("workflows.build", "runs.view", "audit.read", "tasks.view"), asyncHandler(async (req, res) => {
     const row = await store.getWorkflowVersion(req.auth!, param(req, "versionId"));
     if (!row) {
       res.status(404).json({ error: { code: "NOT_FOUND", message: "Workflow not found", request_id: req.id } });
@@ -168,7 +179,7 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
     res.json(row);
   }));
 
-  app.post("/api/v1/workflows/:versionId/activate", auth, asyncHandler(async (req, res) => {
+  app.post("/api/v1/workflows/:versionId/activate", auth, requirePermission("workflows.publish"), asyncHandler(async (req, res) => {
     const row = await store.activateWorkflowVersion(req.auth!, param(req, "versionId"));
     if (!row) {
       res.status(404).json({ error: { code: "NOT_FOUND", message: "Workflow not found", request_id: req.id } });
@@ -177,8 +188,16 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
     res.json(row);
   }));
 
+  const workerBaseUrl = (process.env.WORKER_TRIGGER_URL || "http://127.0.0.1:4005").replace(/\/+$/, "");
+  // Auto-starting a detached worker is a development convenience only. It never happens in tests or
+  // production: a spawned daemon polls the configured database and could execute real queued runs.
+  const autoSpawnWorker = config.nodeEnv === "development" && process.env.WORKER_AUTOSPAWN !== "false" && !process.env.VITEST;
   const triggerWorkerDaemon = (runId: string) => {
-    fetch(`http://127.0.0.1:4005/trigger/${runId}`, { method: "POST" }).catch(async () => {
+    if (!autoSpawnWorker) {
+      fetch(`${workerBaseUrl}/trigger/${runId}`, { method: "POST" }).catch(err => logger.warn({ run_id: runId, err: err?.message }, "Worker trigger failed; the run stays queued for the poller"));
+      return;
+    }
+    fetch(`${workerBaseUrl}/trigger/${runId}`, { method: "POST" }).catch(async () => {
       try {
         const { spawn } = await import("node:child_process");
         const path = await import("node:path");
@@ -197,7 +216,7 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
         logger.info({ run_id: runId }, "Auto-spawned worker daemon for background execution");
 
         setTimeout(() => {
-          fetch(`http://127.0.0.1:4005/trigger/${runId}`, { method: "POST" }).catch(() => {});
+          fetch(`${workerBaseUrl}/trigger/${runId}`, { method: "POST" }).catch(() => {});
         }, 2000);
       } catch (e: any) {
         logger.warn({ error: e?.message }, "Failed to auto-spawn worker daemon");
@@ -205,33 +224,64 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
     });
   };
 
-  app.post("/api/v1/workflows/:versionId/run", auth, asyncHandler(async (req, res) => {
+  app.use("/api/v1", createPlatformRouter({ config, store, triggerRun: triggerWorkerDaemon, workerBaseUrl, auth }));
+
+  app.post("/api/v1/workflows/:versionId/run", auth, requirePermission("workflows.build"), asyncHandler(async (req, res) => {
     const workflow = await store.getWorkflowVersion(req.auth!, param(req, "versionId"));
     if (!workflow) {
       res.status(404).json({ error: { code: "NOT_FOUND", message: "Workflow not found", request_id: req.id } });
       return;
     }
+    const steps = (workflow.workflow as any)?.root_step?.children ?? (workflow.workflow as any)?.steps ?? [];
+    if (!steps.length) {
+      res.status(409).json({ error: "The selected workflow version has no executable steps." });
+      return;
+    }
+    if ((workflow.workflow as any)?.workflow_version === "2.0") {
+      const readiness = assessExecutionReadiness(workflow.workflow as any, { inputs: req.body?.inputs || {} });
+      if (!readiness.executable) {
+        res.status(409).json({ error: "This workflow is not safe to run yet.", code: "WORKFLOW_NOT_EXECUTABLE", issues: readiness.issues.filter(i => i.severity === "BLOCKING") });
+        return;
+      }
+    }
     const run = await store.createRun(req.auth!, workflow.id, req.header("idempotency-key") ?? undefined);
-    triggerWorkerDaemon(run.id);
+    if (!run.idempotentReplay) triggerWorkerDaemon(run.id);
     res.status(202).json({ run });
   }));
 
-  app.get("/api/v1/runs", auth, asyncHandler(async (req, res) => {
-    res.json({ runs: await store.listRuns(req.auth!) });
+  app.get("/api/v1/runs", auth, requirePermission("runs.view", "tasks.run"), asyncHandler(async (req, res) => {
+    const q = req.query as Record<string, string | undefined>;
+    const [runs, workers] = await Promise.all([store.listRuns(req.auth!), store.listGhostWorkers(req.auth!)]);
+    const names = new Map(workers.map(w => [w.id, w.name]));
+    const from = q.from ? Date.parse(q.from) : undefined;
+    const to = q.to ? Date.parse(q.to) : undefined;
+    const states = q.state ? q.state.split(",") : undefined;
+    const filtered = runs
+      // Users without organisation-wide run access see only the runs they launched.
+      .filter(r => hasPermission(req.auth, "runs.view") || r.createdBy === req.auth!.userId)
+      .filter(r => !states || states.includes(r.state))
+      .filter(r => !q.worker_id || r.workerId === q.worker_id)
+      .filter(r => !q.workflow_version_id || r.workflowVersionId === q.workflow_version_id)
+      .filter(r => from === undefined || Date.parse(r.createdAt) >= from)
+      .filter(r => to === undefined || Date.parse(r.createdAt) <= to)
+      .map(r => runSummary(r, r.workerId ? names.get(r.workerId) : undefined))
+      .filter(r => !q.outcome || r.outcome?.classification === q.outcome)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    res.json({ runs: filtered });
   }));
 
-  app.get("/api/v1/runs/:id", auth, asyncHandler(async (req, res) => {
+  app.get("/api/v1/runs/:id", auth, requirePermission("runs.view", "tasks.run", "audit.read"), asyncHandler(async (req, res) => {
     const run = await store.getRun(req.auth!, param(req, "id"));
-    if (!run) { res.status(404).json({ error: "Run not found" }); return; }
-    res.json({ run });
+    if (!run || !(canAccessRun(req.auth!, run, "runs.view") || hasPermission(req.auth, "audit.read"))) { res.status(404).json({ error: "Run not found" }); return; }
+    res.json({ run: runSummary(run) });
   }));
 
-  app.get("/api/v1/audit-log", auth, asyncHandler(async (req, res) => {
+  app.get("/api/v1/audit-log", auth, requirePermission("audit.read"), asyncHandler(async (req, res) => {
     const audits = await store.listAudits(req.auth!);
     res.json({ audits });
   }));
 
-  app.post("/api/v1/runs/:id/hitl/take-control", auth, asyncHandler(async (req, res) => {
+  app.post("/api/v1/runs/:id/hitl/take-control", auth, requirePermission("hitl.decide"), asyncHandler(async (req, res) => {
     try {
       const result = await store.takeHitlControl(req.auth!.tenantId, req.auth!.userId, param(req, "id"));
 
@@ -253,7 +303,7 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
     }
   }));
 
-  app.post("/api/v1/runs/:id/hitl/complete", auth, asyncHandler(async (req, res) => {
+  app.post("/api/v1/runs/:id/hitl/complete", auth, requirePermission("hitl.decide"), asyncHandler(async (req, res) => {
     try {
       await store.completeHitlIntervention(req.auth!.tenantId, param(req, "id"));
       res.json({ success: true, message: "Human intervention marked as complete. Verifying handoff." });
@@ -262,7 +312,7 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
     }
   }));
 
-  app.post("/api/v1/runs/:id/claim", auth, asyncHandler(async (req, res) => {
+  app.post("/api/v1/runs/:id/claim", auth, requirePermission("runs.control"), asyncHandler(async (req, res) => {
     const claimed = await store.claimRun(req.auth!, param(req, "id"));
     if (!claimed) {
       res.status(409).json({ error: { code: "CLAIM_FAILED", message: "Run not available for claiming (not found or not QUEUED)", request_id: req.id } });
@@ -271,7 +321,7 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
     res.json({ run: claimed, steps: await store.listExecutionSteps(req.auth!, claimed.id) });
   }));
 
-  app.post("/api/v1/runs/:id/pause", auth, asyncHandler(async (req, res) => {
+  app.post("/api/v1/runs/:id/pause", auth, requirePermission("runs.control"), asyncHandler(async (req, res) => {
     const run = await store.updateRunState(req.auth!, param(req, "id"), "WAITING_FOR_HUMAN");
     if (!run) {
       res.status(404).json({ error: { code: "NOT_FOUND", message: "Run not found", request_id: req.id } });
@@ -294,33 +344,99 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
     res.status(202).json({ run, hitl: true });
   }));
 
-  app.post("/api/v1/runs/:id/resume", auth, asyncHandler(async (req, res) => {
-    const run = await store.updateRunState(req.auth!, param(req, "id"), "RESUMING");
-    if (!run) {
+  app.post("/api/v1/runs/:id/resume", auth, requirePermission("runs.control"), asyncHandler(async (req, res) => {
+    const runId = param(req, "id");
+    const existing = await store.getRun(req.auth!, runId);
+    if (!existing) {
       res.status(404).json({ error: { code: "NOT_FOUND", message: "Run not found", request_id: req.id } });
       return;
     }
+    const pending = (await store.listHitlRequests(req.auth!)).filter(h => h.runId === runId && (h.state === "PENDING" || h.state === "CONTROL_ACTIVE"));
+    if (pending.length) {
+      res.status(409).json({ error: { code: "DECISION_REQUIRED", message: "Approve or reject the pending request before resuming.", hitl_request_ids: pending.map(h => h.id), request_id: req.id } });
+      return;
+    }
+    const run = await store.updateRunState(req.auth!, runId, "RESUMING");
+    if (!run) {
+      res.status(409).json({ error: { code: "INVALID_STATE", message: `A run in state ${existing.state} cannot be resumed.`, request_id: req.id } });
+      return;
+    }
     await store.writeAudit(req.auth!, "EXECUTION_RESUMED", "execution_run", run.id);
+    triggerWorkerDaemon(run.id);
     res.status(202).json({ run });
   }));
 
-  app.post("/api/v1/runs/:id/cancel", auth, asyncHandler(async (req, res) => {
-    const run = await store.updateRunState(req.auth!, param(req, "id"), "CANCELLED");
-    if (!run) {
+  // Durable human decision on a paused run: APPROVE resumes from the paused step, REJECT stops the run.
+  app.post("/api/v1/hitl/:id/decision", auth, requirePermission("hitl.decide", "hitl.decide_own"), asyncHandler(async (req, res) => {
+    if (!(await mayDecide(req, param(req, "id")))) {
+      res.status(403).json({ error: { code: "FORBIDDEN", message: "You cannot approve or reject this run.", request_id: req.id } });
+      return;
+    }
+    const body = req.body || {};
+    const decision: HitlDecisionInput = {
+      action: String(body.action || "").toUpperCase() as HitlDecisionInput["action"],
+      value: body.value,
+      note: typeof body.note === "string" ? body.note : undefined,
+      expectedRunId: body.run_id,
+      expectedWorkflowVersionId: body.workflow_version_id
+    };
+    try {
+      const result = await store.decideHitlRequest(req.auth!, param(req, "id"), decision);
+      if (result.status === "APPLIED" && result.run.state === "RESUMING") triggerWorkerDaemon(result.run.id);
+      res.status(200).json({ status: result.status, hitl_request: result.hitl, run: result.run });
+    } catch (e: any) {
+      if (e instanceof HitlDecisionError) {
+        const status = e.code === "NOT_FOUND" ? 404 : e.code === "EXPIRED" ? 410 : e.code === "INVALID_DECISION" ? 400 : 409;
+        res.status(status).json({ error: { code: e.code, message: e.message, request_id: req.id } });
+        return;
+      }
+      throw e;
+    }
+  }));
+
+  app.post("/api/v1/runs/:id/cancel", auth, requirePermission("runs.control", "tasks.run"), asyncHandler(async (req, res) => {
+    const existing = await store.getRun(req.auth!, param(req, "id"));
+    if (!existing || !canAccessRun(req.auth!, existing, "runs.control")) {
       res.status(404).json({ error: { code: "NOT_FOUND", message: "Run not found", request_id: req.id } });
+      return;
+    }
+    const run = ["SUCCEEDED", "FAILED", "TIMED_OUT", "CANCELLED"].includes(existing.state)
+      ? undefined
+      : await store.updateRunState(req.auth!, existing.id, "CANCELLED", { resultSummary: { outcome: "CANCELLED_BY_USER", cancelledBy: req.auth!.userId } });
+    if (!run) {
+      res.status(409).json({ error: { code: "INVALID_STATE", message: `A run in state ${existing.state} cannot be cancelled.`, request_id: req.id } });
       return;
     }
     await store.writeAudit(req.auth!, "RUN_CANCELLED", "execution_run", run.id);
     res.status(202).json({ run });
   }));
 
-  app.get("/api/v1/hitl", auth, asyncHandler(async (req, res) => {
-    res.json({ hitl_requests: await store.listHitlRequests(req.auth!) });
+  /** HITL requests the caller may see: all for organisation-wide roles, otherwise only on their own runs. */
+  const visibleHitlRequests = async (req: Request) => {
+    const all = await store.listHitlRequests(req.auth!);
+    if (hasPermission(req.auth, "hitl.decide") || hasPermission(req.auth, "runs.view") || hasPermission(req.auth, "audit.read")) return all;
+    const own = new Set((await store.listRuns(req.auth!)).filter(r => r.createdBy === req.auth!.userId).map(r => r.id));
+    return all.filter(h => own.has(h.runId));
+  };
+
+  /** Whether the caller may decide this HITL request (organisation-wide, or own run when policy allows). */
+  const mayDecide = async (req: Request, hitlId: string): Promise<boolean> => {
+    if (hasPermission(req.auth, "hitl.decide")) return true;
+    if (!hasPermission(req.auth, "hitl.decide_own")) return false;
+    const hitl = (await store.listHitlRequests(req.auth!)).find(h => h.id === hitlId);
+    const run = hitl ? await store.getRun(req.auth!, hitl.runId) : undefined;
+    if (!run || run.createdBy !== req.auth!.userId) return false;
+    const { policies } = await loadPolicies(store, req.auth!, config.hitlSessionTimeoutSeconds);
+    return policies.membersMayApproveOwnRuns;
+  };
+
+  app.get("/api/v1/hitl", auth, requirePermission("hitl.decide", "hitl.decide_own", "runs.view", "audit.read"), asyncHandler(async (req, res) => {
+    res.json({ hitl_requests: await visibleHitlRequests(req) });
   }));
 
 
   // Ghost Workers API
-  app.get("/api/v1/ghost-workers", auth, asyncHandler(async (req, res) => {
+  app.get("/api/v1/ghost-workers", auth, requirePermission("tasks.view", "workflows.build", "ops.view", "runs.view", "audit.read"), asyncHandler(async (req, res) => {
     const rawWorkers = await store.listGhostWorkers(req.auth!);
     const allRuns = await store.listRuns(req.auth!);
 
@@ -356,12 +472,12 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
     res.json({ workers: enriched, ghost_workers: enriched });
   }));
 
-  app.post("/api/v1/ghost-workers", auth, asyncHandler(async (req, res) => {
+  app.post("/api/v1/ghost-workers", auth, requirePermission("workflows.build"), asyncHandler(async (req, res) => {
     const worker = await store.createGhostWorker(req.auth!, req.body);
     res.status(201).json(worker);
   }));
 
-  app.post("/api/v1/ghost-workers/:id/documents", auth, asyncHandler(async (req, res) => {
+  app.post("/api/v1/ghost-workers/:id/documents", auth, requirePermission("workflows.build"), asyncHandler(async (req, res) => {
     const targetId = param(req, "id");
     let worker = await store.getGhostWorker(req.auth!, targetId);
     if (!worker) {
@@ -465,7 +581,7 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
     res.status(201).json({ document: doc });
   }));
 
-  app.get("/api/v1/ghost-workers/:id/documents", auth, asyncHandler(async (req, res) => {
+  app.get("/api/v1/ghost-workers/:id/documents", auth, requirePermission("workflows.build"), asyncHandler(async (req, res) => {
     const targetId = param(req, "id");
     let worker = await store.getGhostWorker(req.auth!, targetId);
     if (!worker) {
@@ -478,7 +594,7 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
     res.json({ documents });
   }));
 
-  app.delete("/api/v1/ghost-workers/:id/documents/:docId", auth, asyncHandler(async (req, res) => {
+  app.delete("/api/v1/ghost-workers/:id/documents/:docId", auth, requirePermission("workflows.build"), asyncHandler(async (req, res) => {
     const targetId = param(req, "id");
     const docId = param(req, "docId");
     let worker = await store.getGhostWorker(req.auth!, targetId);
@@ -487,7 +603,12 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
       worker = all.find(w => w.id === targetId || (w as any).allIds?.includes(targetId)) ||
                all.find(w => w.name && w.name.trim().toLowerCase() === targetId.trim().toLowerCase());
     }
-    const resolvedId = worker ? worker.id : targetId;
+    // Only a document of this tenant's worker is deleted; anything else is 404 and never triggers the purge.
+    if (!worker) { res.status(404).json({ error: "Worker not found" }); return; }
+    const doc = await store.getDocument(req.auth!, docId).catch(() => undefined);
+    const workerIds = [worker.id, ...(((worker as any).allIds as string[] | undefined) ?? [])];
+    if (!doc || (doc.workerId && !workerIds.includes(doc.workerId))) { res.status(404).json({ error: "Document not found" }); return; }
+    const resolvedId = worker.id;
     try {
       await store.deleteDocument(req.auth!, docId);
     } catch (_) {}
@@ -502,7 +623,7 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
     });
   }));
 
-  app.get("/api/v1/ghost-workers/:id", auth, asyncHandler(async (req, res) => {
+  app.get("/api/v1/ghost-workers/:id", auth, requirePermission("tasks.view", "workflows.build", "ops.view", "runs.view", "audit.read"), asyncHandler(async (req, res) => {
     const targetId = param(req, "id");
     let worker = await store.getGhostWorker(req.auth!, targetId);
     const all = await store.listGhostWorkers(req.auth!);
@@ -558,7 +679,7 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
     res.json({ ...worker, allIds });
   }));
 
-  app.post("/api/v1/ghost-workers/:id", auth, asyncHandler(async (req, res) => {
+  app.post("/api/v1/ghost-workers/:id", auth, requirePermission("workflows.build"), asyncHandler(async (req, res) => {
     const worker = await store.updateGhostWorker(req.auth!, param(req, "id"), req.body);
     if (!worker) {
       res.status(404).json({ error: "Worker not found" });
@@ -567,7 +688,7 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
     res.json(worker);
   }));
 
-  app.post("/api/v1/ghost-workers/:id/chat", auth, asyncHandler(async (req, res) => {
+  app.post("/api/v1/ghost-workers/:id/chat", auth, requirePermission("workflows.build"), asyncHandler(async (req, res) => {
     const worker = await store.getGhostWorker(req.auth!, param(req, "id"));
     if (!worker) { res.status(404).json({ error: "Worker not found" }); return; }
 
@@ -605,7 +726,7 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
               const { WorkflowCompiler } = await import("./compiler.js");
               const compiler = new WorkflowCompiler(aiProvider);
               const workflow = await compiler.compile(bps.specificationJson, { version: "phase4-compiler" });
-              newVersion = await store.createWorkflowVersion(req.auth!, workflow as any);
+              newVersion = await store.createWorkflowVersion(req.auth!, withWorker(workflow, worker.id));
               await store.updateGhostWorker(req.auth!, worker.id, { workflowId: newVersion.workflowId, activeVersionId: newVersion.id } as any);
               workflowUpdated = true;
             }
@@ -630,7 +751,7 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
     }
   }));
 
-  app.get("/api/v1/ghost-workers/:id/memory", auth, asyncHandler(async (req, res) => {
+  app.get("/api/v1/ghost-workers/:id/memory", auth, requirePermission("workflows.build"), asyncHandler(async (req, res) => {
     const targetId = param(req, "id");
     let worker = await store.getGhostWorker(req.auth!, targetId);
     if (!worker) {
@@ -643,7 +764,7 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
     res.json({ memory });
   }));
 
-  app.delete("/api/v1/ghost-workers/:id/memory", auth, asyncHandler(async (req, res) => {
+  app.delete("/api/v1/ghost-workers/:id/memory", auth, requirePermission("workflows.build"), asyncHandler(async (req, res) => {
     const targetId = param(req, "id");
     const { purgeWorkerFullState } = await import("./services/doc-purge.js");
     await purgeWorkerFullState(store, req.auth!, targetId);
@@ -651,7 +772,7 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
     res.json({ success: true, message: "All memory and derived workflows purged instantly" });
   }));
 
-  app.delete("/api/v1/ghost-workers/:id/memory/:memoryId", auth, asyncHandler(async (req, res) => {
+  app.delete("/api/v1/ghost-workers/:id/memory/:memoryId", auth, requirePermission("workflows.build"), asyncHandler(async (req, res) => {
     const targetId = param(req, "id");
     const memoryId = param(req, "memoryId");
     let worker = await store.getGhostWorker(req.auth!, targetId);
@@ -673,7 +794,7 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
     res.json({ success: true, message: "Memory item deleted and all workflows/specifications purged instantly" });
   }));
 
-  app.get("/api/v1/ghost-workers/:id/evidence", auth, asyncHandler(async (req, res) => {
+  app.get("/api/v1/ghost-workers/:id/evidence", auth, requirePermission("workflows.build", "audit.read"), asyncHandler(async (req, res) => {
     const targetId = param(req, "id");
     let worker = await store.getGhostWorker(req.auth!, targetId);
     if (!worker) {
@@ -686,7 +807,7 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
     res.json({ evidence });
   }));
 
-  app.post("/api/v1/ghost-workers/:id/recompile", auth, asyncHandler(async (req, res) => {
+  app.post("/api/v1/ghost-workers/:id/recompile", auth, requirePermission("workflows.build"), asyncHandler(async (req, res) => {
     const worker = await store.getGhostWorker(req.auth!, param(req, "id"));
     if (!worker) { res.status(404).json({ error: "Worker not found" }); return; }
 
@@ -703,7 +824,7 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
           const { WorkflowCompiler } = await import("./compiler.js");
           const compiler = new WorkflowCompiler(aiProvider);
           const workflow = await compiler.compile(bps.specificationJson, { version: "phase3-compiler-1.0" });
-          version = await store.createWorkflowVersion(req.auth!, workflow as any);
+          version = await store.createWorkflowVersion(req.auth!, withWorker(workflow, worker.id));
           await store.updateGhostWorker(req.auth!, worker.id, { workflowId: version.workflowId, activeVersionId: version.id } as any);
           const compiledStepsCount = (workflow as any)?.root_step?.children?.length ?? (workflow as any)?.steps?.length ?? 0;
           logger.info({
@@ -722,18 +843,33 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
   }));
 
 
-  app.post("/api/v1/ghost-workers/:id/test", auth, asyncHandler(async (req, res) => {
+  app.post("/api/v1/ghost-workers/:id/test", auth, requirePermission("workflows.build"), asyncHandler(async (req, res) => {
     const worker = await store.getGhostWorker(req.auth!, param(req, "id"));
     if (!worker || !worker.activeVersionId) {
       res.status(404).json({ error: "Worker or active version not found" });
       return;
     }
+    const requestedVersionId = req.body?.workflow_version_id;
+    if (!requestedVersionId) {
+      res.status(400).json({ error: "Select the exact compiled workflow version before running.", code: "WORKFLOW_VERSION_REQUIRED" });
+      return;
+    }
+    if (requestedVersionId && requestedVersionId !== worker.activeVersionId) {
+      res.status(409).json({ error: "The selected workflow version is no longer active.", code: "ACTIVE_WORKFLOW_CHANGED" });
+      return;
+    }
+    const workflow = await store.getWorkflowVersion(req.auth!, worker.activeVersionId);
+    const steps = (workflow?.workflow as any)?.root_step?.children ?? (workflow?.workflow as any)?.steps ?? [];
+    if (!workflow || !steps.length) {
+      res.status(409).json({ error: "The active workflow is missing or has no executable steps." });
+      return;
+    }
     const run = await store.createRun(req.auth!, worker.activeVersionId, req.header("idempotency-key") ?? undefined, worker.id, "TEST");
-    triggerWorkerDaemon(run.id);
+    if (!run.idempotentReplay) triggerWorkerDaemon(run.id);
     res.status(202).json({ run });
   }));
 
-  app.post("/api/v1/ghost-workers/:id/activate", auth, asyncHandler(async (req, res) => {
+  app.post("/api/v1/ghost-workers/:id/activate", auth, requirePermission("workflows.publish"), asyncHandler(async (req, res) => {
     const worker = await store.updateGhostWorker(req.auth!, param(req, "id"), { status: "ACTIVE" });
     if (!worker) {
       res.status(404).json({ error: "Worker not found" });
@@ -750,226 +886,215 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
     res.json(worker);
   }));
 
-  app.post("/api/v1/ghost-workers/:id/run", auth, asyncHandler(async (req, res) => {
-    let worker = await store.getGhostWorker(req.auth!, param(req, "id"));
-    if (!worker) {
-      const all = await store.listGhostWorkers(req.auth!);
-      worker = all.find(w => w.id === param(req, "id") || (w as any).allIds?.includes(param(req, "id")));
-    }
-    if (!worker) {
+  app.post("/api/v1/ghost-workers/:id/run", auth, requirePermission("workflows.build", "runs.control"), asyncHandler(async (req, res) => {
+    // The run uses exactly the requested worker; no same-named sibling or other record is substituted.
+    const worker = await store.getGhostWorker(req.auth!, param(req, "id"));
+    if (!worker || worker.tenantId !== req.auth!.tenantId) {
       res.status(404).json({ error: "Worker not found" });
       return;
     }
 
 
     if (!worker.activeVersionId) {
-      try {
-        const docs = await store.listDocuments(req.auth!, worker.id);
-        if (docs && docs.length > 0) {
-          const { analyzeFromDocuments } = await import("./bpi-service.js");
-          const result = await analyzeFromDocuments(config, store, req.auth!, worker.id);
-          const bps = await store.getBPS(req.auth!, result.bpsId);
-          if (bps) {
-            const { WorkflowCompiler } = await import("./compiler.js");
-            const compiler = new WorkflowCompiler(aiProvider);
-            const workflow = await compiler.compile(bps.specificationJson, { version: "phase3-compiler-1.0" });
-            const version = await store.createWorkflowVersion(req.auth!, workflow as any);
-            await store.updateGhostWorker(req.auth!, worker.id, { workflowId: version.workflowId, activeVersionId: version.id } as any);
-            worker.activeVersionId = version.id;
-          }
-        }
-      } catch (autoErr) {
-        logger.warn({ workerId: worker.id, err: autoErr }, "Auto-compilation from documents skipped");
-      }
-    }
-
-    if (!worker.activeVersionId) {
       res.status(400).json({ error: "Worker does not have an active trained workflow version yet." });
       return;
     }
 
+    const requestedVersionId = req.body?.workflow_version_id;
+    if (!requestedVersionId) {
+      res.status(400).json({ error: "Select the exact compiled workflow version before running.", code: "WORKFLOW_VERSION_REQUIRED" });
+      return;
+    }
+    if (requestedVersionId && requestedVersionId !== worker.activeVersionId) {
+      res.status(409).json({
+        error: "The selected workflow version is no longer active. Refresh the workflow and review it before running.",
+        code: "ACTIVE_WORKFLOW_CHANGED"
+      });
+      return;
+    }
+    const requestedRecordingId = req.body?.recording_id;
+    const sourceRecordingId = (worker.trainingSource as any)?.jobId || worker.recordingId;
+    if ((worker.trainingSource as any)?.type === "VIDEO_RECORDING" && !requestedRecordingId) {
+      res.status(400).json({ error: "Select the source recording associated with this workflow before running.", code: "SOURCE_RECORDING_REQUIRED" });
+      return;
+    }
+    if (requestedRecordingId && requestedRecordingId !== sourceRecordingId) {
+      res.status(409).json({ error: "The selected recording does not match this workflow version.", code: "WORKFLOW_SOURCE_MISMATCH" });
+      return;
+    }
+
+    const activeVersion = await store.getWorkflowVersion(req.auth!, worker.activeVersionId);
+    if (!activeVersion) {
+      res.status(409).json({ error: "The active workflow version could not be loaded. Review or recompile the workflow before running." });
+      return;
+    }
+    const activeWorkflow: any = activeVersion.workflow;
+    const activeStepCount = activeWorkflow?.root_step?.children?.length ?? activeWorkflow?.steps?.length ?? 0;
+    if (activeStepCount < 1) {
+      res.status(409).json({ error: "The active workflow has no executable steps. Compilation must complete before running." });
+      return;
+    }
+    if (activeWorkflow?.workflow_version === "2.0") {
+      const readiness = assessExecutionReadiness(activeWorkflow, { inputs: req.body?.inputs || {} });
+      if (!readiness.executable) {
+        res.status(409).json({ error: "This workflow is not safe to run yet.", code: "WORKFLOW_NOT_EXECUTABLE", issues: readiness.issues.filter(i => i.severity === "BLOCKING") });
+        return;
+      }
+    }
+
     const run = await store.createRun(req.auth!, worker.activeVersionId, req.header("idempotency-key") ?? undefined, worker.id, "PRODUCTION");
-    triggerWorkerDaemon(run.id);
+    if (!run.idempotentReplay) triggerWorkerDaemon(run.id);
     res.status(202).json({ run, workerId: worker.id });
   }));
 
   // Exceptions API (HITL)
-  app.get("/api/v1/exceptions", auth, asyncHandler(async (req, res) => {
+  app.get("/api/v1/exceptions", auth, requirePermission("hitl.decide", "hitl.decide_own", "runs.view", "audit.read"), asyncHandler(async (req, res) => {
     // Alias to hitl_requests for the frontend product layer
-    res.json({ exceptions: await store.listHitlRequests(req.auth!) });
+    res.json({ exceptions: await visibleHitlRequests(req) });
   }));
 
-  app.post("/api/v1/exceptions/:id/resolve", auth, asyncHandler(async (req, res) => {
+  /** Maps a HITL decision failure to an HTTP response; returns false if the error is not one. */
+  const sendDecisionError = (res: Response, req: Request, e: unknown): boolean => {
+    if (!(e instanceof HitlDecisionError)) return false;
+    const status = e.code === "NOT_FOUND" ? 404 : e.code === "EXPIRED" ? 410 : e.code === "INVALID_DECISION" ? 400 : 409;
+    res.status(status).json({ error: { code: e.code, message: e.message, request_id: req.id } });
+    return true;
+  };
+
+  app.post("/api/v1/exceptions/:id/resolve", auth, requirePermission("hitl.decide", "hitl.decide_own"), asyncHandler(async (req, res) => {
+    const hitlId = param(req, "id");
+    if (!(await mayDecide(req, hitlId))) {
+      res.status(403).json({ error: { code: "FORBIDDEN", message: "You cannot resolve this exception.", request_id: req.id } });
+      return;
+    }
+    const hitl = (await store.listHitlRequests(req.auth!)).find(h => h.id === hitlId);
+    if (!hitl) {
+      res.status(404).json({ error: "Exception not found" });
+      return;
+    }
+    const run = await store.getRun(req.auth!, hitl.runId);
+    if (!run) {
+      res.status(404).json({ error: "Linked run not found" });
+      return;
+    }
+
+    const credentials = req.body.credentials || (req.body.username || req.body.password || req.body.otp ? { username: req.body.username, password: req.body.password, otp: req.body.otp } : null);
     try {
-      const hitls = await store.listHitlRequests(req.auth!);
-      const hitl = hitls.find(h => h.id === param(req, "id"));
-      if (!hitl) {
-        res.status(404).json({ error: "Exception not found" });
-        return;
-      }
-
-      const run = await store.getRun(req.auth!, hitl.runId);
-      if (!run) throw new Error("Linked run not found");
-
-      const credentials = req.body.credentials || (req.body.username || req.body.password || req.body.otp ? { username: req.body.username, password: req.body.password, otp: req.body.otp } : null);
       if (credentials) {
-        // Forward transiently to worker daemon for active page typing (Never stored in database)
-        await fetch(`http://127.0.0.1:4005/hitl-resolve/${hitl.runId}`, {
+        // Credentials go only to the live session; they are never written to storage or the audit trail.
+        const delivered = await fetch(`${workerBaseUrl}/hitl-resolve/${hitl.runId}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(credentials),
           signal: AbortSignal.timeout(3000)
-        }).catch(() => null);
-
-        // Mark all matching pending HITL requests for this run as RESOLVED
-        await (store as any).supabase?.from("hitl_requests").update({
-          state: "RESOLVED",
-          resolved_at: new Date().toISOString()
-        }).eq("id", hitl.id);
-
-        await (store as any).supabase?.from("hitl_requests").update({
-          state: "RESOLVED",
-          resolved_at: new Date().toISOString()
-        }).eq("run_id", hitl.runId).eq("state", "PENDING");
-
-        await store.updateRunState(req.auth!, hitl.runId, "RUNNING", { hitl_resolved: true }).catch(() => {});
-
-        // FAST RETURN: Authentication submission resumes immediately without saving credentials anywhere
+        }).then(r => r.json()).catch(() => ({ ok: false }));
+        const result = await store.decideHitlRequest(req.auth!, hitl.id, { action: "PROVIDE_VALUE", value: "CREDENTIALS_SUPPLIED_TO_LIVE_SESSION" });
         res.json({
           success: true,
-          message: "Credentials transmitted securely to live execution session. Resumed.",
-          workflow_updated: false,
-          new_version_id: null,
-          blocking_gaps: 0,
-          recompile_error: null
+          status: result.status,
+          message: (delivered as any)?.handled
+            ? "Credentials were typed into the live session; execution continues."
+            : "No live session was waiting. The run will resume and ask for credentials again on the live page.",
+          run: result.run,
+          workflow_updated: false
         });
         return;
       }
 
-      // ──────────────────────────────────────────────────────────
-      // Non-credential guidance / clarification resolution
-      // ──────────────────────────────────────────────────────────
-      const resolution = req.body.resolution || req.body.text || req.body.answer || "Resolved manually by operator";
-      await fetch(`http://127.0.0.1:4005/hitl-resolve/${hitl.runId}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ resolution }),
-        signal: AbortSignal.timeout(3000)
-      }).catch(() => null);
+      const action = String(req.body.action || "APPROVE").toUpperCase() as HitlDecisionInput["action"];
+      const resolution = req.body.resolution || req.body.text || req.body.answer;
+      const result = await store.decideHitlRequest(req.auth!, hitl.id, {
+        action,
+        ...(action === "PROVIDE_VALUE" ? { value: req.body.value ?? resolution } : {}),
+        note: typeof resolution === "string" ? resolution : undefined,
+        expectedWorkflowVersionId: req.body.workflow_version_id
+      });
+      if (result.status === "DUPLICATE") {
+        res.json({ success: true, status: "DUPLICATE", message: "This decision was already recorded.", run: result.run, workflow_updated: false });
+        return;
+      }
+      if (result.run.state === "RESUMING") triggerWorkerDaemon(result.run.id);
 
-      // If we don't own it, take control first implicitly
-      await store.takeHitlControl(req.auth!.tenantId, req.auth!.userId, hitl.runId).catch(() => {});
+      if (typeof resolution === "string" && resolution.trim() && run.workerId) {
+        await store.addMemoryRule(req.auth!, run.workerId, resolution, { source: "HITL", runId: hitl.runId, hitlRequestId: hitl.id, is_auth: false }).catch(() => {});
+      }
 
-      // Mark HITL request as RESOLVED in database
-      await (store as any).supabase?.from("hitl_requests").update({
-        state: "RESOLVED",
-        resolved_at: new Date().toISOString()
-      }).eq("id", hitl.id);
+      // The paused run keeps its pinned workflow version. A video-trained worker is never recompiled from
+      // documents here, because that would replace its demonstrated workflow with an unrelated one.
+      const worker = run.workerId ? await store.getGhostWorker(req.auth!, run.workerId) : undefined;
+      const videoTrained = (worker?.trainingSource as any)?.type === "VIDEO_RECORDING";
 
-      await (store as any).supabase?.from("hitl_requests").update({
-        state: "RESOLVED",
-        resolved_at: new Date().toISOString()
-      }).eq("run_id", hitl.runId).eq("state", "PENDING");
-
-      // Save correction to memory
-      await store.addMemoryRule(req.auth!, run.workerId!, resolution, {
-        source: "HITL",
-        runId: hitl.runId,
-        is_auth: false
-      }).catch(() => {});
-
-      await store.completeHitlIntervention(req.auth!.tenantId, hitl.runId).catch(() => {});
-      await store.updateRunState(req.auth!, hitl.runId, "RUNNING", { hitl_resolved: true, resolution }).catch(() => {});
-
-      // Recompile with a 10s timeout so the HTTP client never aborts/times out
+      // Document-trained workers learn from the correction: recompile from their documents and make
+      // the result the next active version (bounded wait; it continues in the background otherwise).
       let workflowUpdated = false;
       let newVersionId: string | null = null;
-      let blockingGaps = 0;
-      let recompileError: string | null = null;
-      try {
+      let recompile = videoTrained ? "SKIPPED_VIDEO_TRAINED_WORKER" : "NOT_REQUESTED";
+      if (!videoTrained && run.workerId && typeof resolution === "string" && resolution.trim()) {
         const recompileTask = async () => {
           const { analyzeFromDocuments } = await import("./bpi-service.js");
-          const result = await analyzeFromDocuments(config, store, req.auth!, run.workerId!);
-          blockingGaps = result.gaps.filter(g => g.blocking).length;
-          if (blockingGaps === 0) {
-            const bps = await store.getBPS(req.auth!, result.bpsId);
-            if (bps) {
-              const { WorkflowCompiler } = await import("./compiler.js");
-              const compiler = new WorkflowCompiler(aiProvider);
-              const workflow = await compiler.compile(bps.specificationJson, { version: "phase3-compiler-1.0" });
-              const version = await store.createWorkflowVersion(req.auth!, workflow as any);
-              await store.updateGhostWorker(req.auth!, run.workerId!, { workflowId: version.workflowId, activeVersionId: version.id } as any);
-              workflowUpdated = true;
-              newVersionId = version.id;
-            }
-          }
+          const analysis = await analyzeFromDocuments(config, store, req.auth!, run.workerId!);
+          if (analysis.gaps.some(g => g.blocking)) return "BLOCKED_BY_GAPS";
+          const bps = await store.getBPS(req.auth!, analysis.bpsId);
+          if (!bps) return "NO_SPECIFICATION";
+          const { WorkflowCompiler } = await import("./compiler.js");
+          const workflow = await new WorkflowCompiler(aiProvider).compile(bps.specificationJson, { version: "phase3-compiler-1.0" });
+          const version = await store.createWorkflowVersion(req.auth!, withWorker(workflow, run.workerId!));
+          await store.updateGhostWorker(req.auth!, run.workerId!, { workflowId: version.workflowId, activeVersionId: version.id } as any);
+          workflowUpdated = true;
+          newVersionId = version.id;
+          return "RECOMPILED";
         };
-
-        const timeoutPromise = new Promise<{ timeout: true }>((resolve) => setTimeout(() => resolve({ timeout: true }), 10000));
-        const resOrTimeout = await Promise.race([recompileTask(), timeoutPromise]);
-
-        if (resOrTimeout && typeof resOrTimeout === "object" && "timeout" in resOrTimeout) {
-          // Recompilation is still running in background; respond immediately so browser does not timeout
-          res.json({
-            success: true,
-            message: "Correction saved. Workflow recompilation is proceeding in background.",
-            workflow_updated: false,
-            new_version_id: null,
-            blocking_gaps: 0,
-            recompile_error: null
-          });
-          return;
-        }
-      } catch (e: any) {
-        logger.error({ err: e, run_id: hitl.runId }, "exception_resolve_recompile_failed");
-        recompileError = e.message || "Recompilation failed";
+        const timeout = new Promise<string>(resolve => setTimeout(() => resolve("CONTINUING_IN_BACKGROUND"), 10_000));
+        recompile = await Promise.race([
+          recompileTask().catch((err: any) => { logger.error({ err, run_id: hitl.runId }, "exception_resolve_recompile_failed"); return `FAILED: ${err.message}`; }),
+          timeout
+        ]);
       }
 
       res.json({
         success: true,
-        message: workflowUpdated
-          ? "Exception resolved. Memory updated and a new workflow version is now active."
-          : recompileError
-            ? `Correction saved, but recompilation failed: ${recompileError}`
-            : "Correction saved. Additional clarification is still needed before the workflow can update.",
+        status: result.status,
+        decision: action,
+        run: result.run,
+        message: action === "REJECT"
+          ? "Rejected. The run was stopped and no further steps will execute."
+          : "Decision recorded. The run resumes from the paused step on its original workflow version.",
         workflow_updated: workflowUpdated,
         new_version_id: newVersionId,
-        blocking_gaps: blockingGaps,
-        recompile_error: recompileError
+        recompile
       });
     } catch (e: any) {
+      if (sendDecisionError(res, req, e)) return;
       res.status(400).json({ error: { code: "EXCEPTION_RESOLVE_ERROR", message: e.message } });
     }
   }));
 
-  app.post("/api/v1/runs/:id/hitl/submit-credentials", auth, asyncHandler(async (req, res) => {
+  app.post("/api/v1/runs/:id/hitl/submit-credentials", auth, requirePermission("hitl.decide", "hitl.decide_own"), asyncHandler(async (req, res) => {
     const runId = param(req, "id");
     const { username, password, otp } = req.body || {};
+    const run = await store.getRun(req.auth!, runId);
+    if (!run || !canAccessRun(req.auth!, run, "hitl.decide", "hitl.decide_own")) {
+      res.status(404).json({ error: { code: "NOT_FOUND", message: "Run not found", request_id: req.id } });
+      return;
+    }
     try {
-      // Forward transiently to worker daemon
-      const resp = await fetch(`http://127.0.0.1:4005/hitl-resolve/${runId}`, {
+      // Forward transiently to the live session; credentials are never persisted.
+      const resp = await fetch(`${workerBaseUrl}/hitl-resolve/${runId}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username, password, otp }),
         signal: AbortSignal.timeout(3000)
       }).then(r => r.json()).catch(() => ({ ok: false }));
 
-      // Find any pending HITL request for this run and mark resolved
-      const hitls = await store.listHitlRequests(req.auth!);
-      const pendingHitls = hitls.filter(h => h.runId === runId && h.state === "PENDING");
-      for (const ph of pendingHitls) {
-        await (store as any).supabase?.from("hitl_requests").update({
-          state: "RESOLVED",
-          resolved_at: new Date().toISOString()
-        }).eq("id", ph.id);
+      const pending = (await store.listHitlRequests(req.auth!)).filter(h => h.runId === runId && (h.state === "PENDING" || h.state === "CONTROL_ACTIVE"));
+      for (const ph of pending) {
+        await store.decideHitlRequest(req.auth!, ph.id, { action: "PROVIDE_VALUE", value: "CREDENTIALS_SUPPLIED_TO_LIVE_SESSION" }).catch(() => undefined);
       }
-
-      await store.updateRunState(req.auth!, runId, "RUNNING", { hitl_resolved: true });
 
       res.json({
         success: true,
-        message: "Credentials submitted securely. Execution resumed.",
-        workerHandled: resp.ok
+        message: (resp as any).handled ? "Credentials submitted to the live session." : "No live session was waiting; the run will ask again when it resumes.",
+        workerHandled: Boolean((resp as any).handled)
       });
     } catch (err: any) {
       res.status(400).json({ error: { code: "CREDENTIAL_SUBMIT_ERROR", message: err.message } });
@@ -980,7 +1105,7 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
   // BPI Analysis & Clarification
   // ──────────────────────────────────────────────────────────
 
-  app.post("/api/v1/ghost-workers/:id/analyze", auth, asyncHandler(async (req, res) => {
+  app.post("/api/v1/ghost-workers/:id/analyze", auth, requirePermission("workflows.build"), asyncHandler(async (req, res) => {
     const worker = await store.getGhostWorker(req.auth!, param(req, "id"));
     if (!worker) { res.status(404).json({ error: "Worker not found" }); return; }
     const recordingId = req.body?.recording_id ?? worker.recordingId;
@@ -994,7 +1119,7 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
     }
   }));
 
-  app.post("/api/v1/ghost-workers/:id/analyze-documents", auth, asyncHandler(async (req, res) => {
+  app.post("/api/v1/ghost-workers/:id/analyze-documents", auth, requirePermission("workflows.build"), asyncHandler(async (req, res) => {
     const worker = await store.getGhostWorker(req.auth!, param(req, "id"));
     if (!worker) { res.status(404).json({ error: "Worker not found" }); return; }
 
@@ -1007,7 +1132,7 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
     }
   }));
 
-  app.get("/api/v1/ghost-workers/:id/gaps", auth, asyncHandler(async (req, res) => {
+  app.get("/api/v1/ghost-workers/:id/gaps", auth, requirePermission("workflows.build"), asyncHandler(async (req, res) => {
     const targetId = param(req, "id");
     let worker = await store.getGhostWorker(req.auth!, targetId);
     if (!worker) {
@@ -1088,7 +1213,7 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
     res.json({ gaps, blocking_count: blocking.length, optional_count: optional.length });
   }));
 
-  app.post("/api/v1/ghost-workers/:id/gaps/:gapId/answer", auth, asyncHandler(async (req, res) => {
+  app.post("/api/v1/ghost-workers/:id/gaps/:gapId/answer", auth, requirePermission("workflows.build"), asyncHandler(async (req, res) => {
     const worker = await store.getGhostWorker(req.auth!, param(req, "id"));
     if (!worker || !worker.bpsId) { res.status(404).json({ error: "Worker or BPS not found" }); return; }
     const answerRaw = req.body?.answer ?? req.body?.value ?? req.body?.answer_text ?? req.body;
@@ -1164,7 +1289,7 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
           const { WorkflowCompiler } = await import("./compiler.js");
           const compiler = new WorkflowCompiler(aiProvider);
           const workflow = await compiler.compile(freshBps.specificationJson, { version: "phase4-compiler" });
-          const version = await store.createWorkflowVersion(req.auth!, workflow as any);
+          const version = await store.createWorkflowVersion(req.auth!, withWorker(workflow, worker.id));
           await store.updateGhostWorker(req.auth!, worker.id, { workflowId: version.workflowId, activeVersionId: version.id } as any);
           recompiled = true;
           newVersionId = version.id;
@@ -1184,7 +1309,7 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
     });
   }));
 
-  app.get("/api/v1/ghost-workers/:id/plan", auth, asyncHandler(async (req, res) => {
+  app.get("/api/v1/ghost-workers/:id/plan", auth, requirePermission("workflows.build"), asyncHandler(async (req, res) => {
     let worker = await store.getGhostWorker(req.auth!, param(req, "id"));
     if (!worker) {
       const all = await store.listGhostWorkers(req.auth!);
@@ -1233,14 +1358,14 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
     res.status(404).json({ error: "Automation plan not found" });
   }));
 
-  app.post("/api/v1/ghost-workers/:id/oir/draft", auth, asyncHandler(async (req, res) => {
+  app.post("/api/v1/ghost-workers/:id/oir/draft", auth, requirePermission("workflows.build"), asyncHandler(async (req, res) => {
     const worker = await store.getGhostWorker(req.auth!, param(req, "id"));
     if (!worker) { res.status(404).json({ error: "Worker not found" }); return; }
     const envelope = await createOirDraft(store, req.auth!, worker, req.body ?? {});
     res.status(201).json({ oir_review: envelope });
   }));
 
-  app.get("/api/v1/ghost-workers/:id/oir", auth, asyncHandler(async (req, res) => {
+  app.get("/api/v1/ghost-workers/:id/oir", auth, requirePermission("workflows.build"), asyncHandler(async (req, res) => {
     const worker = await store.getGhostWorker(req.auth!, param(req, "id"));
     if (!worker) { res.status(404).json({ error: "Worker not found" }); return; }
     const envelope = readOirReview(worker);
@@ -1248,7 +1373,7 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
     res.json({ oir_review: envelope });
   }));
 
-  app.post("/api/v1/ghost-workers/:id/oir/approve", auth, asyncHandler(async (req, res) => {
+  app.post("/api/v1/ghost-workers/:id/oir/approve", auth, requirePermission("workflows.publish"), asyncHandler(async (req, res) => {
     const worker = await store.getGhostWorker(req.auth!, param(req, "id"));
     if (!worker) { res.status(404).json({ error: "Worker not found" }); return; }
     try {
@@ -1259,14 +1384,14 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
     }
   }));
 
-  app.get("/api/v1/ghost-workers/:id/analysis-stage", auth, asyncHandler(async (req, res) => {
+  app.get("/api/v1/ghost-workers/:id/analysis-stage", auth, requirePermission("workflows.build"), asyncHandler(async (req, res) => {
     const worker = await store.getGhostWorker(req.auth!, param(req, "id"));
     if (!worker) { res.status(404).json({ error: "Worker not found" }); return; }
     const { getStageLabel } = await import("./bpi-service.js");
     res.json({ stage: worker.analysisStage ?? "READING_DEMONSTRATION", label: getStageLabel((worker.analysisStage ?? "READING_DEMONSTRATION") as any), status: worker.status });
   }));
 
-  app.post("/api/v1/ghost-workers/:id/compile", auth, asyncHandler(async (req, res) => {
+  app.post("/api/v1/ghost-workers/:id/compile", auth, requirePermission("workflows.build"), asyncHandler(async (req, res) => {
     const worker = await store.getGhostWorker(req.auth!, param(req, "id"));
     if (!worker || !worker.bpsId) { res.status(404).json({ error: "Worker or BPS not found" }); return; }
     const bps = await store.getBPS(req.auth!, worker.bpsId);
@@ -1275,7 +1400,7 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
       const { WorkflowCompiler } = await import("./compiler.js");
       const compiler = new WorkflowCompiler(aiProvider);
       const workflow = await compiler.compile(bps.specificationJson, { version: "phase3-compiler-1.0" });
-      const version = await store.createWorkflowVersion(req.auth!, workflow as any);
+      const version = await store.createWorkflowVersion(req.auth!, withWorker(workflow, worker.id));
       await store.updateGhostWorker(req.auth!, worker.id, { workflowId: version.workflowId, activeVersionId: version.id } as any);
       const compiledStepsCount = (workflow as any)?.root_step?.children?.length ?? (workflow as any)?.steps?.length ?? 0;
       logger.info({
@@ -1308,7 +1433,7 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
     }
   }));
 
-  app.post("/api/v1/ghost-workers/:id/workflow/edit", auth, asyncHandler(async (req, res) => {
+  app.post("/api/v1/ghost-workers/:id/workflow/edit", auth, requirePermission("workflows.build"), asyncHandler(async (req, res) => {
     const worker = await store.getGhostWorker(req.auth!, param(req, "id"));
     if (!worker || !worker.activeVersionId) { res.status(404).json({ error: "Worker or active version not found" }); return; }
 
@@ -1330,7 +1455,7 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
       return;
     }
 
-    const version = await store.createWorkflowVersion(req.auth!, editedWorkflow);
+    const version = await store.createWorkflowVersion(req.auth!, withWorker(editedWorkflow, worker.id));
     await store.updateGhostWorker(req.auth!, worker.id, { workflowId: version.workflowId, activeVersionId: version.id } as any);
 
     res.status(201).json({ workflow_version_id: version.id, workflow_id: version.workflowId, message: "New workflow version created successfully" });
@@ -1341,31 +1466,32 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
   // Schedules
   // ──────────────────────────────────────────────────────────
 
-  app.get("/api/v1/ghost-workers/:id/schedules", auth, asyncHandler(async (req, res) => {
+  app.get("/api/v1/ghost-workers/:id/schedules", auth, requirePermission("workflows.build", "ops.view"), asyncHandler(async (req, res) => {
     res.json({ schedules: await store.listSchedules(req.auth!, param(req, "id")) });
   }));
 
-  app.post("/api/v1/ghost-workers/:id/schedules", auth, asyncHandler(async (req, res) => {
+  app.post("/api/v1/ghost-workers/:id/schedules", auth, requirePermission("workflows.build"), asyncHandler(async (req, res) => {
     const worker = await store.getGhostWorker(req.auth!, param(req, "id"));
     if (!worker) { res.status(404).json({ error: "Worker not found" }); return; }
     const schedule = await store.createSchedule(req.auth!, { workerId: worker.id, cronExpression: req.body?.cron_expression ?? "0 9 * * *" });
     res.status(201).json(schedule);
   }));
 
-  app.delete("/api/v1/schedules/:id", auth, asyncHandler(async (req, res) => {
+  app.delete("/api/v1/schedules/:id", auth, requirePermission("workflows.build"), asyncHandler(async (req, res) => {
     const ok = await store.deleteSchedule(req.auth!, param(req, "id"));
-    res.json({ deleted: ok });
+    if (!ok) { res.status(404).json({ error: "Schedule not found" }); return; }
+    res.json({ deleted: true });
   }));
 
   // ──────────────────────────────────────────────────────────
   // Connections
   // ──────────────────────────────────────────────────────────
 
-  app.get("/api/v1/connections", auth, asyncHandler(async (req, res) => {
+  app.get("/api/v1/connections", auth, requirePermission("org.view", "workflows.build"), asyncHandler(async (req, res) => {
     res.json({ connections: await store.listConnections(req.auth!) });
   }));
 
-  app.post("/api/v1/connections", auth, asyncHandler(async (req, res) => {
+  app.post("/api/v1/connections", auth, requirePermission("org.manage"), asyncHandler(async (req, res) => {
     const conn = await store.createConnection(req.auth!, {
       name: req.body?.name ?? "Untitled",
       system: req.body?.system ?? "unknown",
@@ -1375,7 +1501,7 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
     res.status(201).json(conn);
   }));
 
-  app.delete("/api/v1/connections/:id", auth, asyncHandler(async (req, res) => {
+  app.delete("/api/v1/connections/:id", auth, requirePermission("org.manage"), asyncHandler(async (req, res) => {
     const ok = await store.deleteConnection(req.auth!, param(req, "id"));
     res.json({ deleted: ok });
   }));
@@ -1394,32 +1520,38 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
   }));
 
   // Settings API
-  const tenantSettings = new Map<string, Record<string, any>>();
+  const DEFAULT_SETTINGS = {
+    theme: "dark",
+    telemetry: true,
+    notifications: { email: true, hitl: true },
+    browserTimeout: 30000,
+    defaultModel: config.openRouterVisionModel
+  };
+  const SETTING_VALIDATORS: Record<string, (v: unknown) => boolean> = {
+    theme: v => v === "dark" || v === "light",
+    telemetry: v => typeof v === "boolean",
+    notifications: v => Boolean(v) && typeof v === "object" && Object.values(v as object).every(x => typeof x === "boolean"),
+    browserTimeout: v => typeof v === "number" && Number.isInteger(v) && v >= 5000 && v <= 300000,
+    defaultModel: v => typeof v === "string" && v.length > 0 && v.length < 200
+  };
 
+  // Settings are stored on the organisation record so they survive restarts.
   app.get("/api/v1/settings", auth, asyncHandler(async (req, res) => {
-    const tenantId = req.auth!.tenantId;
-    const current = tenantSettings.get(tenantId) || {
-      theme: "dark",
-      telemetry: true,
-      notifications: { email: true, hitl: true },
-      browserTimeout: 30000,
-      defaultModel: config.geminiModel || "gemini-2.5-flash",
-    };
-    res.json({ settings: current });
+    const stored = await store.getOrgSettings(req.auth!);
+    res.json({ settings: { ...DEFAULT_SETTINGS, ...(stored.preferences || {}) } });
   }));
 
-  app.patch("/api/v1/settings", auth, asyncHandler(async (req, res) => {
-    const tenantId = req.auth!.tenantId;
-    const existing = tenantSettings.get(tenantId) || {
-      theme: "dark",
-      telemetry: true,
-      notifications: { email: true, hitl: true },
-      browserTimeout: 30000,
-      defaultModel: config.geminiModel || "gemini-2.5-flash",
-    };
-    const updated = { ...existing, ...req.body };
-    tenantSettings.set(tenantId, updated);
-    res.json({ settings: updated });
+  app.patch("/api/v1/settings", auth, requirePermission("org.manage"), asyncHandler(async (req, res) => {
+    const body = req.body && typeof req.body === "object" ? req.body : {};
+    const errors = Object.entries(body).filter(([k, v]) => !SETTING_VALIDATORS[k] || !SETTING_VALIDATORS[k]!(v)).map(([k]) => k);
+    if (errors.length) {
+      res.status(400).json({ error: { code: "INVALID_SETTINGS", message: `Unsupported or invalid settings: ${errors.join(", ")}`, request_id: req.id } });
+      return;
+    }
+    const stored = await store.getOrgSettings(req.auth!);
+    const preferences = { ...(stored.preferences || {}), ...body };
+    await store.updateOrgSettings(req.auth!, { preferences });
+    res.json({ settings: { ...DEFAULT_SETTINGS, ...preferences } });
   }));
 
 
@@ -1428,11 +1560,15 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
   // Run Detail & Result
   // ──────────────────────────────────────────────────────────
 
-  app.get("/api/v1/runs/:id/detail", auth, asyncHandler(async (req, res) => {
+  app.get("/api/v1/runs/:id/detail", auth, requirePermission("runs.view", "tasks.run", "audit.read"), asyncHandler(async (req, res) => {
     const run = await store.getRun(req.auth!, param(req, "id"));
-    if (!run) { res.status(404).json({ error: "Run not found" }); return; }
+    if (!run || !(canAccessRun(req.auth!, run, "runs.view") || hasPermission(req.auth, "audit.read"))) { res.status(404).json({ error: "Run not found" }); return; }
     const steps = await store.listExecutionSteps(req.auth!, run.id);
     const hitls = (await store.listHitlRequests(req.auth!)).filter(h => h.runId === run.id);
+    const pinnedVersion = run.workflowVersionId ? await store.getWorkflowVersion(req.auth!, run.workflowVersionId) : undefined;
+    const runWorker = run.workerId ? await store.getGhostWorker(req.auth!, run.workerId) : undefined;
+    const { policies } = await loadPolicies(store, req.auth!, config.hitlSessionTimeoutSeconds);
+    const controls = computeRunControls(run, steps, hitls, pinnedVersion?.workflow, req.auth!, policies);
 
     // Fetch planned steps and target URL from workflow definition
     let plannedSteps: any[] = [];
@@ -1484,9 +1620,23 @@ export function createApp(config: ApiConfig = loadConfig(), store: AppStore = cr
       domDiff: (s.metadata as any)?.domDiff || (s.metadata as any)?.outputs?.domDiff
     })).sort((a, b) => (a.time ?? "").localeCompare(b.time ?? ""));
 
-    res.json({ 
-      run, 
-      steps, 
+    const pinnedWorkflow: any = pinnedVersion?.workflow;
+    res.json({
+      run: runSummary(run, runWorker?.name),
+      controls,
+      worker: runWorker ? { id: runWorker.id, name: runWorker.name } : null,
+      workflow_version: pinnedVersion ? {
+        id: pinnedVersion.id,
+        name: String(pinnedWorkflow?.name || ""),
+        description: String(pinnedWorkflow?.description || ""),
+        createdAt: pinnedVersion.createdAt,
+        status: pinnedWorkflow?.status,
+        stepCount: workflowLeaves(pinnedWorkflow).length,
+        ...(pinnedWorkflow?.compiler?.source_recording_id ? { sourceRecordingId: String(pinnedWorkflow.compiler.source_recording_id) } : {}),
+        isPublished: runWorker?.publishedVersionId === pinnedVersion.id,
+        summary: versionSummary(pinnedVersion, runWorker)
+      } : null,
+      steps,
       planned_steps: plannedSteps,
       target_url: targetUrl,
       expected_domains: expectedDomains,

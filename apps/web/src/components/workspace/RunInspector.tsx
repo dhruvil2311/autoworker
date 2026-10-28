@@ -81,15 +81,14 @@ function LiveBrowserViewport({
   targetUrl?: string | null;
   sessionUrl?: string | null;
 }) {
-  // Derive target URL from step metadata, worker name, or targetUrl passed from run
-  const isSauce = worker?.name?.toLowerCase().includes('sauce');
+  // Show a destination only when it is attached to this run or workflow.
   const stepTarget = currentStep?.metadata?.target || currentStep?.metadata?.url || currentStep?.metadata?.selector || currentStep?.args?.url || '';
   const resolvedTargetUrl = targetUrl || worker?.targetUrl;
   const pageUrl = (currentStep?.metadata?.url && currentStep.metadata.url.startsWith('http'))
     ? currentStep.metadata.url
     : (stepTarget.startsWith('http')
       ? stepTarget
-      : (resolvedTargetUrl || (isSauce ? 'https://www.saucedemo.com/inventory.html' : 'https://app.workspace.internal')));
+      : (resolvedTargetUrl || 'Destination not established'));
   const stepLabel = currentStep?.name || currentStep?.stepId || currentStep?.event || currentStep?.strategy || 'Action in Progress';
   const errorMessage = currentStep?.metadata?.error || currentStep?.metadata?.message || (isFailed ? 'Action target was not found on active page DOM' : null);
 
@@ -1121,6 +1120,7 @@ export function RunInspector({
   const [guidanceText, setGuidanceText] = useState<string>('');
   const [submittingGuidance, setSubmittingGuidance] = useState<boolean>(false);
   const [transitionStep, setTransitionStep] = useState<number>(0);
+  const [decisionMessage, setDecisionMessage] = useState<string>('');
   const [userSelectedTab, setUserSelectedTab] = useState<'output' | 'viewport' | null>(null);
   const [authUsername, setAuthUsername] = useState<string>('');
   const [authPassword, setAuthPassword] = useState<string>('');
@@ -1290,42 +1290,33 @@ export function RunInspector({
     durationStr = `${diff}s (active)`;
   }
 
-  // Handle Human Guidance Submission
-  const handleSubmitGuidance = async (e?: React.FormEvent) => {
-    if (e) e.preventDefault();
-    if (!guidanceText.trim() || submittingGuidance) return;
+  // Records the operator decision on the paused request. The same run resumes from its paused
+  // step (APPROVE) or stops (REJECT); a new run is never started here, so completed steps are not repeated.
+  const submitDecision = async (action: 'APPROVE' | 'REJECT') => {
+    const target = hitls.find((h: any) => h.state === 'PENDING' || h.state === 'CONTROL_ACTIVE');
+    if (!target?.id || submittingGuidance) return;
+    if (action === 'APPROVE' && !guidanceText.trim()) return;
     setSubmittingGuidance(true);
-    setTransitionStep(1); // 1. Guidance received
-
+    setTransitionStep(1);
     try {
-      if (worker?.id) {
-        await api.sendChatInstruction(worker.id, guidanceText.trim());
-      }
-      const pendingHitl = hitls.find((h: any) => h.state === 'PENDING');
-      if (pendingHitl?.id) {
-        await api.resolveException(pendingHitl.id, { resolution: guidanceText.trim() }).catch(() => null);
-      }
-
-      setTimeout(() => setTransitionStep(2), 500); // 2. Decision recorded in audit log
-      setTimeout(() => setTransitionStep(3), 1000); // 3. Memory updated
-      setTimeout(() => setTransitionStep(4), 1600); // 4. Workflow recompiled v2.0
-      setTimeout(async () => {
-        setTransitionStep(5);
-        if (onRunAgain) {
-          await onRunAgain();
-        } else if (onResolved) {
-          onResolved();
-        }
-        await fetchDetail();
-        setSubmittingGuidance(false);
-        setTransitionStep(0);
-        setGuidanceText('');
-      }, 2300);
+      const res = await api.resolveException(target.id, { action, resolution: guidanceText.trim() || undefined });
+      setTransitionStep(2);
+      setDecisionMessage(res?.message || (action === 'REJECT' ? 'Rejected. The run was stopped.' : 'Decision recorded. The run resumes from the paused step.'));
+      setTransitionStep(3);
+      await fetchDetail();
+      if (onResolved) onResolved();
     } catch (err: any) {
-      alert(err.message || "Failed to transmit guidance.");
+      setDecisionMessage(err?.message || 'The decision could not be recorded.');
+    } finally {
       setSubmittingGuidance(false);
       setTransitionStep(0);
+      setGuidanceText('');
     }
+  };
+
+  const handleSubmitGuidance = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    await submitDecision('APPROVE');
   };
 
   const pendingHitl = hitls.find((h: any) => h.state === 'PENDING');
@@ -1371,10 +1362,9 @@ export function RunInspector({
   };
 
   const transitionItems = [
-    { num: 1, label: 'Human Guidance Received', detail: guidanceText || 'Instruction registered' },
-    { num: 2, label: 'Recorded in Audit Register', detail: `Worker ${worker?.name || 'Digital Worker'} trace updated` },
-    { num: 3, label: 'Operational Memory Rule Added', detail: 'Workflow policy adapted from operator direction' },
-    { num: 4, label: 'Workflow Recompiled (v2.0)', detail: 'Deterministic action branch re-optimized' },
+    { num: 1, label: 'Decision sent', detail: guidanceText || 'Operator decision' },
+    { num: 2, label: 'Decision recorded in audit log', detail: `Run ${String(run?.id || '').slice(0, 8)} on its pinned workflow version` },
+    { num: 3, label: 'Run state updated', detail: decisionMessage || 'Resuming from the paused step' },
   ];
 
   function formatDescriptiveIssue(raw: string, step: any, challenge: any): string {
@@ -2146,8 +2136,22 @@ export function RunInspector({
                     disabled={submittingGuidance || !guidanceText.trim()}
                     style={{ justifyContent: 'center', padding: '8px', fontSize: 10 }}
                   >
-                    {submittingGuidance ? <><Loader2 size={11} className="animate-spin" /> Transmitting...</> : <><Send size={11} /> Transmit Solution & Continue</>}
+                    {submittingGuidance ? <><Loader2 size={11} className="animate-spin" /> Transmitting...</> : <><Send size={11} /> Approve & Resume Paused Step</>}
                   </button>
+                  <button
+                    type="button"
+                    onClick={() => submitDecision('REJECT')}
+                    disabled={submittingGuidance}
+                    style={{
+                      justifyContent: 'center', padding: '7px', fontSize: 10, borderRadius: 6, cursor: 'pointer',
+                      background: 'rgba(248,81,73,0.08)', border: '1px solid rgba(248,81,73,0.35)', color: '#f85149'
+                    }}
+                  >
+                    Reject & Stop Run
+                  </button>
+                  {decisionMessage && (
+                    <div style={{ fontSize: 9, color: 'rgba(255,255,255,0.6)' }}>{decisionMessage}</div>
+                  )}
                 </form>
               )}
             </div>

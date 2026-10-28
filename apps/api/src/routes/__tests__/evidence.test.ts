@@ -57,26 +57,22 @@ describe("Evidence Compilation Route", () => {
         semantic_actions: [
           {
             sequence: 1,
-            timestamp: new Date().toISOString(),
-            semantic_type: "READ_FIELD",
-            application: "EXCEL.EXE",
-            target: {
-              semanticRole: "CELL",
-              visibleText: "Amount"
-            },
-            intent: "Read order amount from cell",
-            evidence: {
-              frame_index: 2,
-              timestamp_offset: 4.5,
-              confidence: 0.95,
-              reasoning: "Observed cell selection"
-            }
+            start_timestamp: 4.5,
+            action_type: "READ_FIELD",
+            application: "Excel",
+            target_description: "Amount cell",
+            summary: "Read order amount from cell",
+            parameters: { field_label: "Amount", selector: "A2" },
+            confidence: 0.95,
+            provenance: { frame_ids: ["frame_2"], rationale: "Observed cell selection" }
           }
         ],
         process_understanding: {
-          title: "Order Extraction",
-          summary: "Process order in Excel and submit to ERP",
-          steps: ["Read order amount"]
+          task_intent: "Read order amount from an Excel worksheet",
+          description: "Read the demonstrated order amount from a spreadsheet",
+          applications_involved: ["Excel"],
+          outputs: [{ description: "Read order amount" }],
+          business_rules: []
         },
         uncertainties: []
       }

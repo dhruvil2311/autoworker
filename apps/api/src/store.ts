@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { isLegalRunTransition, validateHitlDecision, HitlDecisionError, HUMAN_WAIT_STATES, TERMINAL_RUN_STATES, type HitlDecisionInput } from "./run-state.js";
 import fs from "node:fs";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import type { RecordingUpload, Workflow, AnyWorkflow } from "@ghost/workflow-schema";
@@ -34,12 +35,34 @@ export type RunRow = {
   workflowVersionId: string;
   state: string;
   idempotencyKey?: string;
+  idempotentReplay?: boolean;
   workerId?: string;
   runMode?: string;
   metadata?: Record<string, unknown>;
   resultSummary?: any;
+  /** User who launched the run. */
+  createdBy?: string | undefined;
   createdAt: string;
   updatedAt: string;
+};
+
+export type MemberRow = {
+  userId: string;
+  role: string;
+  email?: string | undefined;
+  displayName?: string | undefined;
+  joinedAt?: string | undefined;
+};
+
+export type AuditEventRow = {
+  id: string;
+  tenantId: string;
+  actorId?: string | undefined;
+  action: string;
+  resourceType: string;
+  resourceId?: string | undefined;
+  metadata: Record<string, unknown>;
+  createdAt: string;
 };
 
 export type ExecutionStepRow = {
@@ -61,7 +84,20 @@ export type HitlRequestRow = {
   reason: string;
   challengeType?: string;
   state: "PENDING" | "CONTROL_ACTIVE" | "VERIFYING" | "RESOLVED" | "EXPIRED" | "CANCELLED";
+  workflowStepId?: string | undefined;
+  workflowVersionId?: string | undefined;
+  expiresAt?: string | undefined;
+  decision?: "APPROVE" | "REJECT" | "PROVIDE_VALUE" | undefined;
+  decisionPayload?: Record<string, unknown> | undefined;
+  decidedBy?: string | undefined;
+  decidedAt?: string | undefined;
   createdAt: string;
+};
+
+export type HitlDecisionResult = {
+  status: "APPLIED" | "DUPLICATE";
+  hitl: HitlRequestRow;
+  run: RunRow;
 };
 
 export type AuditAction =
@@ -72,7 +108,14 @@ export type AuditAction =
   | "RUN_CREATED"
   | "EXECUTION_PAUSED"
   | "EXECUTION_RESUMED"
-  | "RUN_CANCELLED";
+  | "RUN_CANCELLED"
+  | "HITL_DECISION"
+  | "RUNS_SUPERSEDED"
+  | "WORKFLOW_PUBLISHED"
+  | "RUN_RETRIED"
+  | "MEMBER_ROLE_CHANGED"
+  | "POLICIES_UPDATED"
+  | "AUDIT_EXPORTED";
 
 export interface ExecutionCheckpointRow {
   id: string;
@@ -95,6 +138,8 @@ export type GhostWorkerRow = {
   status: string;
   workflowId?: string;
   activeVersionId?: string;
+  /** Version business users run; changes only when a builder publishes. */
+  publishedVersionId?: string;
   recordingId?: string;
   bpsId?: string;
   triggerType?: string;
@@ -318,8 +363,22 @@ export interface AppStore {
   loadExecutionCheckpoint(auth: AuthContext, runId: string): Promise<ExecutionCheckpointRow | undefined>;
   createHitlRequest(auth: AuthContext, params: { runId: string, workflowStepId: string, challengeType: string, expiresAt: string }): Promise<void>;
   listHitlRequests(auth: AuthContext): Promise<HitlRequestRow[]>;
+  /**
+   * Records an approval, rejection or provided value for a pending HITL request and moves the run
+   * accordingly. Idempotent for an identical repeat; a conflicting or late decision is rejected.
+   */
+  decideHitlRequest(auth: AuthContext, hitlId: string, decision: HitlDecisionInput): Promise<HitlDecisionResult>;
+  /** Cancels a worker's in-flight runs (history is kept) when its workflow is replaced. */
+  supersedeWorkerRuns(auth: AuthContext, workerId: string, reason: string): Promise<number>;
   writeAudit(auth: AuthContext, action: AuditAction, resourceType: string, resourceId?: string, metadata?: Record<string, unknown>): Promise<void>;
-  listAudits(auth: AuthContext): Promise<any[]>;
+  listAudits(auth: AuthContext): Promise<AuditEventRow[]>;
+  listMembers(auth: AuthContext): Promise<MemberRow[]>;
+  /** Registers the caller as a member if absent (development auth only). */
+  ensureMember(auth: AuthContext): Promise<void>;
+  updateMemberRole(auth: AuthContext, userId: string, role: string): Promise<MemberRow | undefined>;
+  getOrgSettings(auth: AuthContext): Promise<Record<string, any>>;
+  updateOrgSettings(auth: AuthContext, patch: Record<string, any>): Promise<Record<string, any>>;
+  listWorkflowVersionsForWorker(auth: AuthContext, workerId: string, knownIds?: string[]): Promise<WorkflowVersionRow[]>;
 
   // BPS
   createBPS(auth: AuthContext, data: { workerId: string; recordingId?: string; status: string; specificationJson: any; generalizationJson: any; gapsJson: any[] }): Promise<BPSRow>;
@@ -439,6 +498,8 @@ export class InMemoryStore implements AppStore {
   desktopEventsList: DesktopExecutionEventRow[] = [];
   desktopCorrectionsList = new Map<string, DesktopCorrectionRow>();
   desktopAppRegistryList = new Map<string, DesktopApplicationRegistryRow>();
+  membersList = new Map<string, MemberRow & { tenantId: string }>();
+  orgSettings = new Map<string, Record<string, any>>();
 
   constructor() {}
 
@@ -506,15 +567,12 @@ export class InMemoryStore implements AppStore {
   async getGhostWorker(auth: AuthContext, id: string): Promise<GhostWorkerRow | undefined> {
     let row = this.workers.get(id);
     if (!row) {
-      row = [...this.workers.values()].find(w => w.id === id || w.name.toLowerCase() === id.toLowerCase());
+      row = [...this.workers.values()].find(w => (w.id === id || w.name.toLowerCase() === id.toLowerCase()) && (!auth?.tenantId || w.tenantId === auth.tenantId));
     }
-    if (row && !row.activeVersionId) {
-      const sibling = [...this.workers.values()].find(w => w.name.toLowerCase() === row!.name.toLowerCase() && w.activeVersionId);
-      if (sibling) {
-        if (sibling.activeVersionId) row.activeVersionId = sibling.activeVersionId;
-        if (sibling.workflowId) row.workflowId = sibling.workflowId;
-      }
+    if (row && auth?.tenantId && row.tenantId !== auth.tenantId) {
+      return undefined;
     }
+    // A worker's workflow is its own: never borrow another (same-named) worker's active version.
     return row;
   }
 
@@ -563,17 +621,10 @@ export class InMemoryStore implements AppStore {
     const row = this.workers.get(id);
     if (!row || row.tenantId !== auth.tenantId) return undefined;
     Object.assign(row, updates);
-    if (updates.activeVersionId === null || updates.activeVersionId === undefined) {
-      delete (row as any).activeVersionId;
-    }
-    if (updates.workflowId === null || updates.workflowId === undefined) {
-      delete (row as any).workflowId;
-    }
-    if (updates.bpsId === null || updates.bpsId === undefined) {
-      delete (row as any).bpsId;
-    }
-    if (updates.trainingSource === null || updates.trainingSource === undefined) {
-      delete (row as any).trainingSource;
+    // A field is cleared only when the update names it explicitly with null/undefined; omitting a
+    // field (e.g. a status-only update) must leave the worker's workflow binding intact.
+    for (const key of ["activeVersionId", "publishedVersionId", "workflowId", "bpsId", "trainingSource"] as const) {
+      if (key in updates && (updates as any)[key] == null) delete (row as any)[key];
     }
     row.updatedAt = new Date().toISOString();
     return row;
@@ -680,10 +731,10 @@ export class InMemoryStore implements AppStore {
     return row;
   }
 
-  async createRun(auth: AuthContext, workflowVersionId: string, idempotencyKey?: string, workerId?: string, runMode?: string): Promise<RunRow> {
+  async createRun(auth: AuthContext, workflowVersionId: string, idempotencyKey?: string, workerId?: string, runMode?: string, inputs?: Record<string, unknown>): Promise<RunRow> {
     if (idempotencyKey) {
       const existing = [...this.runs.values()].find((run) => run.tenantId === auth.tenantId && run.idempotencyKey === idempotencyKey);
-      if (existing) return existing;
+      if (existing) return { ...existing, idempotentReplay: true };
     }
     const now = new Date().toISOString();
     const row: RunRow = {
@@ -691,9 +742,11 @@ export class InMemoryStore implements AppStore {
       tenantId: auth.tenantId,
       workflowVersionId,
       state: "QUEUED",
+      createdBy: auth.userId,
       createdAt: now,
       updatedAt: now
     };
+    if (inputs && Object.keys(inputs).length) row.metadata = { inputs };
     if (idempotencyKey) row.idempotencyKey = idempotencyKey;
     if (workerId) row.workerId = workerId;
     if (runMode) row.runMode = runMode;
@@ -728,20 +781,7 @@ export class InMemoryStore implements AppStore {
     if (!run || run.tenantId !== auth.tenantId) return undefined;
     
     if (state && run.state !== state) {
-      const validTransitions: Record<string, string[]> = {
-        NEW: ["QUEUED"],
-        QUEUED: ["STARTING", "RUNNING", "FAILED"],
-        STARTING: ["RUNNING", "FAILED"],
-        RUNNING: ["SUCCEEDED", "FAILED", "PAUSED", "WAITING_FOR_HUMAN", "RESUMING"],
-        WAITING_FOR_HUMAN: ["HUMAN_CONTROL_ACTIVE", "RESUMING", "RUNNING", "FAILED"],
-        HUMAN_CONTROL_ACTIVE: ["VERIFYING_HANDOFF", "FAILED"],
-        VERIFYING_HANDOFF: ["RESUMING", "RUNNING", "FAILED"],
-        RESUMING: ["RUNNING", "FAILED"],
-        PAUSED: ["RUNNING", "FAILED"],
-        SUCCEEDED: [],
-        FAILED: []
-      };
-      if (!validTransitions[run.state]?.includes(state)) return undefined;
+      if (!isLegalRunTransition(run.state, state)) return undefined;
       run.state = state;
     }
     if (metadata) {
@@ -819,12 +859,18 @@ export class InMemoryStore implements AppStore {
   }
 
   async createHitlRequest(auth: AuthContext, params: { runId: string, workflowStepId: string, challengeType: string, expiresAt: string }): Promise<void> {
-    this.hitl.set(params.runId, {
-      id: crypto.randomUUID(),
+    const run = this.runs.get(params.runId);
+    const id = crypto.randomUUID();
+    this.hitl.set(id, {
+      id,
       tenantId: auth.tenantId,
       runId: params.runId,
       reason: params.challengeType,
+      challengeType: params.challengeType,
       state: "PENDING",
+      workflowStepId: params.workflowStepId,
+      workflowVersionId: run?.workflowVersionId,
+      expiresAt: params.expiresAt,
       createdAt: new Date().toISOString()
     });
     
@@ -842,11 +888,85 @@ export class InMemoryStore implements AppStore {
     return [...this.hitl.values()].filter((row) => row.tenantId === auth.tenantId);
   }
 
+  async decideHitlRequest(auth: AuthContext, hitlId: string, decision: HitlDecisionInput): Promise<HitlDecisionResult> {
+    validateHitlDecision(decision);
+    const hitl = this.hitl.get(hitlId);
+    if (!hitl || hitl.tenantId !== auth.tenantId) throw new HitlDecisionError("NOT_FOUND", "HITL request not found");
+    const run = this.runs.get(hitl.runId);
+    if (!run || run.tenantId !== auth.tenantId) throw new HitlDecisionError("NOT_FOUND", "Linked run not found");
+    const payload = { value: decision.value, note: decision.note };
+
+    if (hitl.state === "RESOLVED") {
+      if (hitl.decision === decision.action && JSON.stringify(hitl.decisionPayload?.value) === JSON.stringify(decision.value)) {
+        return { status: "DUPLICATE", hitl, run };
+      }
+      throw new HitlDecisionError("STALE_DECISION", `This request was already decided (${hitl.decision}).`);
+    }
+    if (hitl.state !== "PENDING" && hitl.state !== "CONTROL_ACTIVE") {
+      throw new HitlDecisionError("STALE_DECISION", `This request is ${hitl.state.toLowerCase()} and can no longer be decided.`);
+    }
+    if (decision.expectedRunId && decision.expectedRunId !== hitl.runId) {
+      throw new HitlDecisionError("STALE_DECISION", "The decision refers to a different run.");
+    }
+    if (decision.expectedWorkflowVersionId && decision.expectedWorkflowVersionId !== run.workflowVersionId) {
+      throw new HitlDecisionError("STALE_DECISION", "The decision refers to a different workflow version than the paused run.");
+    }
+    if (hitl.expiresAt && Date.parse(hitl.expiresAt) < Date.now()) {
+      hitl.state = "EXPIRED";
+      if (isLegalRunTransition(run.state, "TIMED_OUT")) {
+        run.state = "TIMED_OUT";
+        run.resultSummary = { outcome: "WAITING_FOR_HUMAN_TIMED_OUT", hitlRequestId: hitl.id };
+        run.updatedAt = new Date().toISOString();
+      }
+      throw new HitlDecisionError("EXPIRED", "The approval window for this request has expired.");
+    }
+    if (!HUMAN_WAIT_STATES.has(run.state)) {
+      throw new HitlDecisionError("RUN_NOT_WAITING", `The run is ${run.state}; it is not waiting for a decision.`);
+    }
+
+    hitl.state = "RESOLVED";
+    hitl.decision = decision.action;
+    hitl.decisionPayload = payload;
+    hitl.decidedBy = auth.userId;
+    hitl.decidedAt = new Date().toISOString();
+
+    if (decision.action === "REJECT") {
+      run.state = "CANCELLED";
+      run.resultSummary = { outcome: "REJECTED_BY_HUMAN", hitlRequestId: hitl.id, stepId: hitl.workflowStepId, note: decision.note };
+      for (const other of this.hitl.values()) {
+        if (other.runId === run.id && other.id !== hitl.id && (other.state === "PENDING" || other.state === "CONTROL_ACTIVE")) other.state = "CANCELLED";
+      }
+    } else {
+      if (run.state === "HUMAN_CONTROL_ACTIVE") run.state = "VERIFYING_HANDOFF";
+      run.state = "RESUMING";
+    }
+    run.updatedAt = new Date().toISOString();
+    await this.writeAudit(auth, "HITL_DECISION", "execution_run", run.id, {
+      hitl_request_id: hitl.id, decision: decision.action, step_id: hitl.workflowStepId,
+      workflow_version_id: run.workflowVersionId, resulting_state: run.state, note: decision.note
+    });
+    return { status: "APPLIED", hitl, run };
+  }
+
+  async supersedeWorkerRuns(auth: AuthContext, workerId: string, reason: string): Promise<number> {
+    let count = 0;
+    for (const run of this.runs.values()) {
+      if (run.tenantId !== auth.tenantId || run.workerId !== workerId || TERMINAL_RUN_STATES.has(run.state)) continue;
+      run.state = "CANCELLED";
+      run.resultSummary = { outcome: "SUPERSEDED", reason };
+      run.updatedAt = new Date().toISOString();
+      count++;
+    }
+    if (count) await this.writeAudit(auth, "RUNS_SUPERSEDED", "ghost_worker", workerId, { cancelled_runs: count, reason });
+    return count;
+  }
+
   async writeAudit(auth: AuthContext, action: AuditAction, resourceType: string, resourceId?: string, metadata?: Record<string, unknown>): Promise<void> {
     const auditId = crypto.randomUUID();
     this.auditsList.set(auditId, {
       id: auditId,
       tenantId: auth.tenantId,
+      actorId: auth.userId,
       action,
       resourceType,
       resourceId,
@@ -855,10 +975,46 @@ export class InMemoryStore implements AppStore {
     });
   }
 
-  async listAudits(auth: AuthContext): Promise<any[]> {
+  async listAudits(auth: AuthContext): Promise<AuditEventRow[]> {
     return Array.from(this.auditsList.values())
       .filter(a => a.tenantId === auth.tenantId)
+      .map(a => ({ ...a, metadata: a.metadata || {} }))
       .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  }
+
+  async listMembers(auth: AuthContext): Promise<MemberRow[]> {
+    return [...this.membersList.values()].filter(m => m.tenantId === auth.tenantId).map(({ tenantId, ...m }) => m);
+  }
+
+  async ensureMember(auth: AuthContext): Promise<void> {
+    const key = `${auth.tenantId}:${auth.userId}`;
+    if (!this.membersList.has(key)) {
+      this.membersList.set(key, { tenantId: auth.tenantId, userId: auth.userId, role: auth.role, joinedAt: new Date().toISOString() });
+    }
+  }
+
+  async updateMemberRole(auth: AuthContext, userId: string, role: string): Promise<MemberRow | undefined> {
+    const member = this.membersList.get(`${auth.tenantId}:${userId}`);
+    if (!member) return undefined;
+    member.role = role;
+    const { tenantId, ...rest } = member;
+    return rest;
+  }
+
+  async getOrgSettings(auth: AuthContext): Promise<Record<string, any>> {
+    return { ...(this.orgSettings.get(auth.tenantId) || {}) };
+  }
+
+  async updateOrgSettings(auth: AuthContext, patch: Record<string, any>): Promise<Record<string, any>> {
+    const next = { ...(this.orgSettings.get(auth.tenantId) || {}), ...patch };
+    this.orgSettings.set(auth.tenantId, next);
+    return { ...next };
+  }
+
+  async listWorkflowVersionsForWorker(auth: AuthContext, workerId: string, knownIds: string[] = []): Promise<WorkflowVersionRow[]> {
+    return [...this.workflows.values()]
+      .filter(v => v.tenantId === auth.tenantId && ((v.workflow as any)?.compiler?.worker_id === workerId || knownIds.includes(v.id)))
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
 
   // BPS
@@ -1358,46 +1514,17 @@ export class SupabaseStore implements AppStore {
     if (!id) return undefined;
     const scope = getTenantScope(auth.tenantId);
     let data: any = null;
+    // Lookups are always tenant-scoped, and a worker never inherits another worker's workflow.
     if (isUUID(id)) {
       const res = await this.supabase.from("ghost_workers").select("*").in("tenant_id", scope).eq("id", id).maybeSingle();
       data = res.data;
-      if (!data) {
-        const fallback = await this.supabase.from("ghost_workers").select("*").eq("id", id).maybeSingle();
-        data = fallback.data;
-      }
     }
     if (!data) {
-      const res = await this.supabase.from("ghost_workers").select("*").in("tenant_id", scope).ilike("name", id).maybeSingle();
-      data = res?.data;
-      if (!data) {
-        const fallback = await this.supabase.from("ghost_workers").select("*").ilike("name", id).maybeSingle();
-        data = fallback?.data;
-      }
+      const res = await this.supabase.from("ghost_workers").select("*").in("tenant_id", scope).ilike("name", id).order("created_at", { ascending: false }).limit(1);
+      data = res?.data?.[0];
     }
     if (!data) return undefined;
-    const worker = this.workerFromRow(data);
-    if (!worker.activeVersionId && worker.status !== "NEW" && worker.status !== "IDLE") {
-      // If this specific duplicate row is missing activeVersionId, link from sibling only if non-idle and non-new
-      const { data: siblings } = await this.supabase
-        .from("ghost_workers")
-        .select("*")
-        .ilike("name", worker.name)
-        .not("active_version_id", "is", null)
-        .not("status", "eq", "NEW")
-        .not("status", "eq", "IDLE")
-        .order("created_at", { ascending: false })
-        .limit(1);
-      if (siblings && siblings.length > 0) {
-        if (siblings[0].active_version_id) worker.activeVersionId = siblings[0].active_version_id;
-        if (siblings[0].workflow_id) worker.workflowId = siblings[0].workflow_id;
-      }
-    }
-    const { data: allSiblings } = await this.supabase
-      .from("ghost_workers")
-      .select("id")
-      .ilike("name", worker.name);
-    (worker as any).allIds = Array.from(new Set([worker.id, id, ...(allSiblings?.map(s => s.id) || [])]));
-    return worker;
+    return this.workerFromRow(data);
   }
 
   async addChatInstruction(auth: AuthContext, workerId: string, instruction: string) {
@@ -1573,6 +1700,7 @@ export class SupabaseStore implements AppStore {
     if (updates.status !== undefined) payload.status = updates.status;
     if (updates.workflowId !== undefined) payload.workflow_id = updates.workflowId;
     if (updates.activeVersionId !== undefined) payload.active_version_id = updates.activeVersionId;
+    if (updates.publishedVersionId !== undefined) payload.published_version_id = updates.publishedVersionId;
     if (updates.safetyPolicy !== undefined) payload.safety_policy = updates.safetyPolicy;
     if (updates.bpsId !== undefined) payload.bps_id = updates.bpsId;
     if (updates.recordingId !== undefined) {
@@ -1705,15 +1833,76 @@ export class SupabaseStore implements AppStore {
     return row;
   }
 
-  async listAudits(auth: AuthContext): Promise<any[]> {
+  async listAudits(auth: AuthContext): Promise<AuditEventRow[]> {
+    // writeAudit inserts into audit_logs; reading any other table returns nothing or fails.
     const { data, error } = await this.supabase
-      .from('audit_log')
-      .select('*')
-      .eq('tenant_id', auth.tenantId)
-      .order('created_at', { ascending: false });
-    
+      .from("audit_logs")
+      .select("*")
+      .eq("tenant_id", auth.tenantId)
+      .order("created_at", { ascending: false })
+      .limit(1000);
     if (error) throw error;
-    return data || [];
+    return (data || []).map((row: any) => ({
+      id: row.id,
+      tenantId: row.tenant_id,
+      actorId: row.actor_id ?? undefined,
+      action: row.action,
+      resourceType: row.resource_type,
+      resourceId: row.resource_id ?? undefined,
+      metadata: row.metadata || {},
+      createdAt: row.created_at
+    }));
+  }
+
+  async listMembers(auth: AuthContext): Promise<MemberRow[]> {
+    const { data, error } = await this.supabase.from("organization_members").select("user_id, role, created_at").eq("organization_id", auth.tenantId);
+    if (error) throw error;
+    const ids = (data || []).map((m: any) => m.user_id);
+    const profiles = ids.length
+      ? (await this.supabase.from("profiles").select("id, email, display_name").in("id", ids)).data || []
+      : [];
+    return (data || []).map((m: any) => {
+      const profile = profiles.find((p: any) => p.id === m.user_id);
+      return { userId: m.user_id, role: m.role, email: profile?.email ?? undefined, displayName: profile?.display_name ?? undefined, joinedAt: m.created_at };
+    });
+  }
+
+  async ensureMember(_auth: AuthContext): Promise<void> {
+    // Supabase memberships are created by sign-up/bootstrap, never implicitly by a request.
+  }
+
+  async updateMemberRole(auth: AuthContext, userId: string, role: string): Promise<MemberRow | undefined> {
+    const { data, error } = await this.supabase.from("organization_members").update({ role })
+      .eq("organization_id", auth.tenantId).eq("user_id", userId).select("user_id, role, created_at").maybeSingle();
+    if (error) throw error;
+    return data ? { userId: data.user_id, role: data.role, joinedAt: data.created_at } : undefined;
+  }
+
+  async getOrgSettings(auth: AuthContext): Promise<Record<string, any>> {
+    const { data, error } = await this.supabase.from("organizations").select("settings").eq("id", auth.tenantId).maybeSingle();
+    if (error) throw error;
+    return { ...((data as any)?.settings || {}) };
+  }
+
+  async updateOrgSettings(auth: AuthContext, patch: Record<string, any>): Promise<Record<string, any>> {
+    const next = { ...(await this.getOrgSettings(auth)), ...patch };
+    const { error } = await this.supabase.from("organizations").update({ settings: next, updated_at: new Date().toISOString() }).eq("id", auth.tenantId);
+    if (error) throw error;
+    return next;
+  }
+
+  async listWorkflowVersionsForWorker(auth: AuthContext, workerId: string, knownIds: string[] = []): Promise<WorkflowVersionRow[]> {
+    const byWorker = await this.supabase.from("workflow_versions").select("*").eq("tenant_id", auth.tenantId)
+      .eq("definition->compiler->>worker_id", workerId).order("created_at", { ascending: false }).limit(100);
+    if (byWorker.error) throw byWorker.error;
+    const rows = [...(byWorker.data || [])];
+    const missing = knownIds.filter(id => isUUID(id) && !rows.some((r: any) => r.id === id));
+    if (missing.length) {
+      const extra = await this.supabase.from("workflow_versions").select("*").eq("tenant_id", auth.tenantId).in("id", missing);
+      if (extra.error) throw extra.error;
+      rows.push(...(extra.data || []));
+    }
+    return rows.map(r => this.workflowVersionFromRow(r)).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
 
   async listRecordings(auth: AuthContext): Promise<RecordingRow[]> {
@@ -1785,20 +1974,12 @@ export class SupabaseStore implements AppStore {
   async getWorkflowVersion(auth: AuthContext, id: string): Promise<WorkflowVersionRow | undefined> {
     if (!id || !isUUID(id)) return undefined;
     const scope = getTenantScope(auth.tenantId);
-    let { data, error } = await this.supabase
+    const { data, error } = await this.supabase
       .from("workflow_versions")
       .select("*")
       .in("tenant_id", scope)
       .eq("id", id)
       .maybeSingle();
-    if (!data) {
-      const fallback = await this.supabase
-        .from("workflow_versions")
-        .select("*")
-        .eq("id", id)
-        .maybeSingle();
-      data = fallback.data;
-    }
     if (error) throw error;
     return data ? this.workflowVersionFromRow(data) : undefined;
   }
@@ -1823,7 +2004,7 @@ export class SupabaseStore implements AppStore {
     return { ...row, workflow };
   }
 
-  async createRun(auth: AuthContext, workflowVersionId: string, idempotencyKey?: string, workerId?: string, runMode?: string): Promise<RunRow> {
+  async createRun(auth: AuthContext, workflowVersionId: string, idempotencyKey?: string, workerId?: string, runMode?: string, inputs?: Record<string, unknown>): Promise<RunRow> {
     if (idempotencyKey) {
       const existing = await this.supabase
         .from("execution_runs")
@@ -1832,18 +2013,31 @@ export class SupabaseStore implements AppStore {
         .eq("idempotency_key", idempotencyKey)
         .maybeSingle();
       if (existing.error) throw existing.error;
-      if (existing.data) return this.runFromRow(existing.data);
+      if (existing.data) return { ...this.runFromRow(existing.data), idempotentReplay: true };
     }
     const payload: any = { tenant_id: auth.tenantId, workflow_version_id: workflowVersionId, state: "QUEUED", idempotency_key: idempotencyKey ?? null, created_by: auth.userId };
     if (workerId) payload.worker_id = workerId;
     if (runMode) payload.run_mode = runMode;
+    if (inputs && Object.keys(inputs).length) payload.metadata = { inputs };
 
     const { data, error } = await this.supabase
       .from("execution_runs")
       .insert(payload)
       .select("*")
       .single();
-    if (error) throw error;
+    if (error) {
+      if (idempotencyKey && error.code === "23505") {
+        const replay = await this.supabase
+          .from("execution_runs")
+          .select("*")
+          .eq("tenant_id", auth.tenantId)
+          .eq("idempotency_key", idempotencyKey)
+          .maybeSingle();
+        if (replay.error) throw replay.error;
+        if (replay.data) return { ...this.runFromRow(replay.data), idempotentReplay: true };
+      }
+      throw error;
+    }
     await this.writeAudit(auth, "RUN_CREATED", "execution_run", data.id, { workflow_version_id: workflowVersionId });
     return this.runFromRow(data);
   }
@@ -1929,7 +2123,8 @@ export class SupabaseStore implements AppStore {
 
   async updateRunState(auth: AuthContext, runId: string, state: string, metadata?: any): Promise<RunRow | undefined> {
     const current = await this.getRun(auth, runId);
-    if (!current || !isLegalTransition(current.state, state)) return undefined;
+    if (!current) return undefined;
+    if (current.state !== state && !isLegalRunTransition(current.state, state)) return undefined;
     const updatePayload: Record<string, unknown> = { state, updated_at: new Date().toISOString() };
     if (metadata?.providerSessionId) updatePayload.provider_session_id = metadata.providerSessionId;
     if (metadata?.createdAt) updatePayload.provider_session_created_at = metadata.createdAt;
@@ -1941,11 +2136,13 @@ export class SupabaseStore implements AppStore {
     } else if (metadata?.metadata) {
       updatePayload.metadata = { ...(current.metadata || {}), ...metadata.metadata };
     }
+    // Compare-and-set on the state we validated, so concurrent writers cannot make an illegal jump.
     const { data, error } = await this.supabase
       .from("execution_runs")
       .update(updatePayload)
       .eq("tenant_id", auth.tenantId)
       .eq("id", runId)
+      .eq("state", current.state)
       .select("*")
       .maybeSingle();
     if (error) throw error;
@@ -1955,11 +2152,7 @@ export class SupabaseStore implements AppStore {
   async getRun(auth: AuthContext, runId: string): Promise<RunRow | undefined> {
     if (!runId || !isUUID(runId)) return undefined;
     const scope = getTenantScope(auth.tenantId);
-    let { data, error } = await this.supabase.from("execution_runs").select("*").in("tenant_id", scope).eq("id", runId).maybeSingle();
-    if (!data) {
-      const fallback = await this.supabase.from("execution_runs").select("*").eq("id", runId).maybeSingle();
-      data = fallback.data;
-    }
+    const { data, error } = await this.supabase.from("execution_runs").select("*").in("tenant_id", scope).eq("id", runId).maybeSingle();
     if (error) throw error;
     if (!data) return undefined;
     const run = this.runFromRow(data);
@@ -2069,22 +2262,20 @@ export class SupabaseStore implements AppStore {
 
   async listExecutionSteps(auth: AuthContext, runId: string): Promise<ExecutionStepRow[]> {
     const scope = getTenantScope(auth.tenantId);
-    let { data, error } = await this.supabase.from("execution_steps").select("*").in("tenant_id", scope).eq("run_id", runId);
-    if (!data || data.length === 0) {
-      const fallback = await this.supabase.from("execution_steps").select("*").eq("run_id", runId);
-      if (fallback.data && fallback.data.length > 0) data = fallback.data;
-    }
+    const { data, error } = await this.supabase.from("execution_steps").select("*").in("tenant_id", scope).eq("run_id", runId);
     if (error) throw error;
     return (data ?? []).map((row) => this.executionStepFromRow(row));
   }
 
   async createHitlRequest(auth: AuthContext, params: { runId: string; workflowStepId: string; challengeType: string; expiresAt: string }): Promise<void> {
-    const { data, error } = await this.supabase.from("hitl_requests").insert({ 
-      tenant_id: auth.tenantId, 
-      run_id: params.runId, 
-      reason: params.challengeType, 
+    const run = await this.getRun(auth, params.runId);
+    const { data, error } = await this.supabase.from("hitl_requests").insert({
+      tenant_id: auth.tenantId,
+      run_id: params.runId,
+      reason: params.challengeType,
       state: "PENDING",
       workflow_step_id: params.workflowStepId,
+      workflow_version_id: run?.workflowVersionId ?? null,
       challenge_type: params.challengeType,
       expires_at: params.expiresAt
     }).select("*").single();
@@ -2104,6 +2295,91 @@ export class SupabaseStore implements AppStore {
     const { data, error } = await this.supabase.from("hitl_requests").select("*").eq("tenant_id", auth.tenantId).order("created_at", { ascending: false }).limit(100);
     if (error) throw error;
     return (data ?? []).map((row) => this.hitlFromRow(row));
+  }
+
+  async decideHitlRequest(auth: AuthContext, hitlId: string, decision: HitlDecisionInput): Promise<HitlDecisionResult> {
+    validateHitlDecision(decision);
+    if (!isUUID(hitlId)) throw new HitlDecisionError("NOT_FOUND", "HITL request not found");
+    const { data: row, error } = await this.supabase.from("hitl_requests").select("*").eq("tenant_id", auth.tenantId).eq("id", hitlId).maybeSingle();
+    if (error) throw error;
+    if (!row) throw new HitlDecisionError("NOT_FOUND", "HITL request not found");
+    const hitl = this.hitlFromRow(row);
+    const run = await this.getRun(auth, hitl.runId);
+    if (!run) throw new HitlDecisionError("NOT_FOUND", "Linked run not found");
+    const payload = { value: decision.value ?? null, note: decision.note ?? null };
+
+    if (hitl.state === "RESOLVED") {
+      if (hitl.decision === decision.action && JSON.stringify(hitl.decisionPayload?.value ?? null) === JSON.stringify(payload.value)) {
+        return { status: "DUPLICATE", hitl, run };
+      }
+      throw new HitlDecisionError("STALE_DECISION", `This request was already decided (${hitl.decision ?? "resolved"}).`);
+    }
+    if (hitl.state !== "PENDING" && hitl.state !== "CONTROL_ACTIVE") {
+      throw new HitlDecisionError("STALE_DECISION", `This request is ${hitl.state.toLowerCase()} and can no longer be decided.`);
+    }
+    if (decision.expectedRunId && decision.expectedRunId !== hitl.runId) {
+      throw new HitlDecisionError("STALE_DECISION", "The decision refers to a different run.");
+    }
+    const pausedVersion = hitl.workflowVersionId || run.workflowVersionId;
+    if (decision.expectedWorkflowVersionId && decision.expectedWorkflowVersionId !== pausedVersion) {
+      throw new HitlDecisionError("STALE_DECISION", "The decision refers to a different workflow version than the paused run.");
+    }
+    if (hitl.expiresAt && Date.parse(hitl.expiresAt) < Date.now()) {
+      await this.supabase.from("hitl_requests").update({ state: "EXPIRED" }).eq("tenant_id", auth.tenantId).eq("id", hitl.id).in("state", ["PENDING", "CONTROL_ACTIVE"]);
+      await this.updateRunState(auth, run.id, "TIMED_OUT", { resultSummary: { outcome: "WAITING_FOR_HUMAN_TIMED_OUT", hitlRequestId: hitl.id } });
+      throw new HitlDecisionError("EXPIRED", "The approval window for this request has expired.");
+    }
+    if (!HUMAN_WAIT_STATES.has(run.state)) {
+      throw new HitlDecisionError("RUN_NOT_WAITING", `The run is ${run.state}; it is not waiting for a decision.`);
+    }
+
+    // Claim the request atomically: only one decision can move it out of PENDING/CONTROL_ACTIVE.
+    const decidedAt = new Date().toISOString();
+    const claim = await this.supabase.from("hitl_requests").update({
+      state: "RESOLVED",
+      resolved_at: decidedAt,
+      resolver_id: isUUID(auth.userId) ? auth.userId : null,
+      decision: decision.action,
+      decision_payload: payload,
+      decided_by: isUUID(auth.userId) ? auth.userId : null,
+      decided_at: decidedAt
+    }).eq("tenant_id", auth.tenantId).eq("id", hitl.id).in("state", ["PENDING", "CONTROL_ACTIVE"]).select("*").maybeSingle();
+    if (claim.error) {
+      throw new Error(`Could not record the HITL decision durably (${claim.error.message}). Apply migration 202610290001_hitl_decisions.sql.`);
+    }
+    if (!claim.data) {
+      return this.decideHitlRequest(auth, hitlId, decision);
+    }
+
+    let updatedRun: RunRow | undefined;
+    if (decision.action === "REJECT") {
+      updatedRun = await this.updateRunState(auth, run.id, "CANCELLED", {
+        resultSummary: { outcome: "REJECTED_BY_HUMAN", hitlRequestId: hitl.id, stepId: hitl.workflowStepId, note: decision.note }
+      });
+      await this.supabase.from("hitl_requests").update({ state: "CANCELLED" }).eq("tenant_id", auth.tenantId).eq("run_id", run.id).in("state", ["PENDING", "CONTROL_ACTIVE"]);
+    } else {
+      if (run.state === "HUMAN_CONTROL_ACTIVE") await this.updateRunState(auth, run.id, "VERIFYING_HANDOFF");
+      updatedRun = await this.updateRunState(auth, run.id, "RESUMING");
+    }
+    await this.writeAudit(auth, "HITL_DECISION", "execution_run", run.id, {
+      hitl_request_id: hitl.id, decision: decision.action, step_id: hitl.workflowStepId,
+      workflow_version_id: pausedVersion, resulting_state: updatedRun?.state ?? run.state, note: decision.note ?? null
+    });
+    return { status: "APPLIED", hitl: this.hitlFromRow(claim.data), run: updatedRun ?? run };
+  }
+
+  async supersedeWorkerRuns(auth: AuthContext, workerId: string, reason: string): Promise<number> {
+    const { data, error } = await this.supabase
+      .from("execution_runs")
+      .update({ state: "CANCELLED", result_summary: { outcome: "SUPERSEDED", reason }, updated_at: new Date().toISOString() })
+      .eq("tenant_id", auth.tenantId)
+      .eq("worker_id", workerId)
+      .in("state", ["QUEUED", "STARTING", "RUNNING", "PAUSING", "WAITING_FOR_HUMAN", "HUMAN_CONTROL_ACTIVE", "VERIFYING_HANDOFF", "RESUMING"])
+      .select("id");
+    if (error) throw error;
+    const count = data?.length ?? 0;
+    if (count) await this.writeAudit(auth, "RUNS_SUPERSEDED", "ghost_worker", workerId, { cancelled_runs: count, reason });
+    return count;
   }
 
   async writeAudit(auth: AuthContext, action: AuditAction, resourceType: string, resourceId?: string, metadata: Record<string, unknown> = {}): Promise<void> {
@@ -2237,8 +2513,8 @@ export class SupabaseStore implements AppStore {
     return data ? this.scheduleFromRow(data) : undefined;
   }
   async deleteSchedule(auth: AuthContext, id: string): Promise<boolean> {
-    const { error } = await this.supabase.from("ghost_worker_schedules").delete().eq("tenant_id", auth.tenantId).eq("id", id);
-    return !error;
+    const { data, error } = await this.supabase.from("ghost_worker_schedules").delete().eq("tenant_id", auth.tenantId).eq("id", id).select("id");
+    return !error && (data?.length ?? 0) > 0;
   }
   async listSchedules(auth: AuthContext, workerId?: string): Promise<ScheduleRow[]> {
     let q = this.supabase.from("ghost_worker_schedules").select("*").eq("tenant_id", auth.tenantId);
@@ -2426,6 +2702,7 @@ export class SupabaseStore implements AppStore {
       status: row.status,
       workflowId: row.workflow_id ?? undefined,
       activeVersionId: row.active_version_id ?? undefined,
+      publishedVersionId: row.published_version_id ?? undefined,
       recordingId: row.recording_id ?? undefined,
       bpsId: row.bps_id ?? undefined,
       triggerType: row.trigger_type ?? undefined,
@@ -2498,6 +2775,7 @@ export class SupabaseStore implements AppStore {
       idempotencyKey: row.idempotency_key ?? undefined,
       workerId: row.worker_id ?? undefined,
       runMode: row.run_mode ?? undefined,
+      createdBy: row.created_by ?? undefined,
       metadata: row.metadata ?? undefined,
       resultSummary: row.result_summary ?? row.metadata?.resultSummary ?? undefined,
       createdAt: row.created_at,
@@ -2527,6 +2805,13 @@ export class SupabaseStore implements AppStore {
       reason: row.reason,
       challengeType: row.challenge_type || row.reason,
       state: row.state,
+      workflowStepId: row.workflow_step_id ?? undefined,
+      workflowVersionId: row.workflow_version_id ?? undefined,
+      expiresAt: row.expires_at ?? undefined,
+      decision: row.decision ?? undefined,
+      decisionPayload: row.decision_payload ?? undefined,
+      decidedBy: row.decided_by ?? undefined,
+      decidedAt: row.decided_at ?? undefined,
       createdAt: row.created_at
     };
   }
@@ -3227,23 +3512,6 @@ export class SupabaseStore implements AppStore {
   }
 }
 
-function isLegalTransition(current: string, next: string): boolean {
-  const allowed: Record<string, string[]> = {
-    QUEUED: ["STARTING"],
-    STARTING: ["RUNNING", "FAILED"],
-    RUNNING: ["SUCCEEDED", "FAILED", "PAUSING", "WAITING_FOR_HUMAN"],
-    PAUSING: ["WAITING_FOR_HUMAN"],
-    WAITING_FOR_HUMAN: ["RUNNING", "FAILED", "SUCCEEDED", "HUMAN_CONTROL_ACTIVE", "TIMED_OUT"],
-    HUMAN_CONTROL_ACTIVE: ["VERIFYING_HANDOFF", "FAILED", "TIMED_OUT"],
-    VERIFYING_HANDOFF: ["RESUMING", "FAILED"],
-    RESUMING: ["RUNNING", "FAILED"],
-    SUCCEEDED: [],
-    FAILED: [],
-    TIMED_OUT: [],
-    CANCELLED: []
-  };
-  return (allowed[current] ?? []).includes(next);
-}
 
 function normalizeTimestamp(value: unknown): string {
   if (typeof value === "string") {

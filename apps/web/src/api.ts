@@ -11,12 +11,13 @@ function getToken(): string {
   return token;
 }
 
-async function request<T>(method: string, path: string, body?: unknown, skipUnauthorized = false, timeoutMs = 120000): Promise<T> {
+async function request<T>(method: string, path: string, body?: unknown, skipUnauthorized = false, timeoutMs = 120000, idempotencyKey?: string): Promise<T> {
   const token = getToken();
   const headers: Record<string, string> = {
     "content-type": "application/json",
     authorization: token.startsWith("Bearer ") ? token : `Bearer ${token}`
   };
+  if (idempotencyKey) headers["idempotency-key"] = idempotencyKey;
   
   // Heavy compilation and evidence analysis operations can take longer
   const effectiveTimeout = path.includes("/compile") || path.includes("/analyze") || path.includes("/recompile")
@@ -55,19 +56,27 @@ async function request<T>(method: string, path: string, body?: unknown, skipUnau
 export const api = {
   bootstrap: async () => {
     try {
-      const loginRes = await request<any>("POST", "/api/v1/auth/dev/login", {
-        email: "admin@ghost.local",
-        password: "Ghost@123456"
-      }, true).catch(() => null);
-
-      if (loginRes?.token) {
-        localStorage.setItem("ghost_api_token", loginRes.token);
+      // A signed-in session (Supabase or a complete development token) is never replaced: auto-login
+      // would silently switch the user to the development owner account.
+      const existing = (localStorage.getItem("ghost_api_token") || "").replace(/^Bearer\s+/i, "") || null;
+      const hasSession = Boolean(existing) && (!existing!.startsWith("dev:") || existing!.split(":").length >= 3);
+      if (!hasSession) {
+        const loginRes = await request<any>("POST", "/api/v1/auth/dev/login", {
+          email: "admin@ghost.local",
+          password: "Ghost@123456"
+        }, true).catch(() => null);
+        if (loginRes?.token) {
+          localStorage.setItem("ghost_api_token", loginRes.token);
+        }
       }
 
       const res = await request<any>("POST", "/api/v1/auth/bootstrap", undefined, true);
-      if (res?.organization?.id) {
+      const current = (localStorage.getItem("ghost_api_token") || "").replace(/^Bearer\s+/i, "");
+      if (res?.organization?.id && current.startsWith("dev:")) {
         const userId = res.user?.id || DEV_USER_ID;
-        localStorage.setItem("ghost_api_token", `dev:${userId}:${res.organization.id}:owner`);
+        // Keep the user and role of the current development sign-in; the server enforces what that role may do.
+        const currentRole = current.split(":")[3] || "owner";
+        localStorage.setItem("ghost_api_token", `dev:${userId}:${res.organization.id}:${currentRole}`);
       }
       return res;
     } catch (err) {
@@ -96,7 +105,6 @@ export const api = {
     triggerConfig?: any;
     status?: string | undefined;
   }) => request<any>("POST", "/api/v1/ghost-workers", data),
-  deleteWorker: (id: string) => request<any>("DELETE", `/api/v1/ghost-workers/${id}`),
   updateWorker: (id: string, data: any) => request<any>("POST", `/api/v1/ghost-workers/${id}`, data),
   activateWorker: (id: string) => request<any>("POST", `/api/v1/ghost-workers/${id}/activate`),
   uploadDocument: (id: string, data: { name: string; type: string; content: string }) => request<any>("POST", `/api/v1/ghost-workers/${id}/documents`, data),
@@ -155,17 +163,29 @@ export const api = {
     request<any>("GET", `/api/v1/ghost-workers/${id}/evidence/jobs/${jobId}`),
   getEvidenceTimeline: (id: string, jobId: string) =>
     request<any>("GET", `/api/v1/ghost-workers/${id}/evidence/jobs/${jobId}/timeline`),
-  compileFromEvidenceJob: (id: string, jobId: string) =>
-    request<any>("POST", `/api/v1/ghost-workers/${id}/evidence/compile-from-job/${jobId}`),
-  submitEvidenceClarification: (id: string, data: { question: string; answer: string; uncertaintyId?: string; jobId?: string }) =>
-    request<any>("POST", `/api/v1/ghost-workers/${id}/evidence/clarification`, data),
+  compileFromEvidenceJob: (id: string, jobId: string, taskObjective?: string) =>
+    request<any>("POST", `/api/v1/ghost-workers/${id}/evidence/compile-from-job/${jobId}`, taskObjective ? { taskObjective } : {}),
 
   // Compilation
   compileWorker: (id: string) => request<any>("POST", `/api/v1/ghost-workers/${id}/compile`),
 
   // Test & Run
   testWorker: (id: string) => request<any>("POST", `/api/v1/ghost-workers/${id}/test`),
-  runWorker: (id: string) => request<any>("POST", `/api/v1/ghost-workers/${id}/run`),
+  runWorker: async (id: string, workflowVersionId?: string, recordingId?: string) => {
+    if (!workflowVersionId) throw new Error("This worker has no selected compiled workflow version. Compile a workflow before running.");
+    const keyName = `ghost:run:${id}:${workflowVersionId}`;
+    let idempotencyKey = sessionStorage.getItem(keyName);
+    if (!idempotencyKey) {
+      idempotencyKey = crypto.randomUUID();
+      sessionStorage.setItem(keyName, idempotencyKey);
+    }
+    const result = await request<any>("POST", `/api/v1/ghost-workers/${id}/run`, {
+      workflow_version_id: workflowVersionId,
+      ...(recordingId ? { recording_id: recordingId } : {})
+    }, false, 120000, idempotencyKey);
+    sessionStorage.removeItem(keyName);
+    return result;
+  },
 
   // Runs
   listRuns: () => request<{ runs: any[] }>("GET", "/api/v1/runs"),
@@ -180,6 +200,9 @@ export const api = {
     return { hitl_requests: data.hitl_requests || data.exceptions || [] };
   },
   resolveException: (id: string, resolution: any) => request<any>("POST", `/api/v1/exceptions/${id}/resolve`, resolution),
+  decideHitl: (id: string, action: "APPROVE" | "REJECT" | "PROVIDE_VALUE", options: { value?: unknown; note?: string; runId?: string; workflowVersionId?: string } = {}) =>
+    request<any>("POST", `/api/v1/hitl/${id}/decision`, { action, value: options.value, note: options.note, run_id: options.runId, workflow_version_id: options.workflowVersionId }),
+  cancelRun: (runId: string) => request<any>("POST", `/api/v1/runs/${runId}/cancel`),
   takeControl: (runId: string) => request<any>("POST", `/api/v1/runs/${runId}/hitl/take-control`),
   completeHitl: (runId: string) => request<any>("POST", `/api/v1/runs/${runId}/hitl/complete`),
 

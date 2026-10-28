@@ -102,7 +102,7 @@ JSON TARGET SCHEMA STRUCTURE:
     const isBrowser = env.includes("browser") || env.includes("web") || env.includes("http");
 
     // Extract detected domain if present in application_environment or sequence flow
-    const extractedDomains: string[] = options.expectedDomains || [];
+    const extractedDomains: string[] = [...(options.expectedDomains || [])];
     const urlMatch = summary.application_environment.match(/https?:\/\/([^/\s)]+)/i);
     if (urlMatch && urlMatch[1]) {
       extractedDomains.push(urlMatch[1]);
@@ -112,6 +112,9 @@ JSON TARGET SCHEMA STRUCTURE:
 
     // Ensure we start with a clean navigation step if in browser environment
     let hasNavigation = analysis.sequence_flow.some(s => s.interaction === "NAVIGATE" || s.target_element.startsWith("http"));
+    if (isBrowser && !hasNavigation && !urlMatch && extractedDomains.length === 0 && analysis.sequence_flow.length > 0) {
+      throw new Error("Browser workflow has no demonstrated or configured destination URL; clarification is required before compilation.");
+    }
     if (isBrowser && urlMatch && !hasNavigation) {
       steps.push({
         id: "step_1_init_navigate",
@@ -152,7 +155,13 @@ JSON TARGET SCHEMA STRUCTURE:
           }
         });
       } else if (flow.interaction === "NAVIGATE" || targetStr.startsWith("http")) {
-        const destUrl = targetStr.startsWith("http") ? targetStr : (urlMatch ? urlMatch[0] : "https://saucedemo.com/");
+        const configuredDomain = extractedDomains[0];
+        const destUrl = targetStr.startsWith("http")
+          ? targetStr
+          : (urlMatch?.[0] || (configuredDomain ? `https://${configuredDomain}` : ""));
+        if (!destUrl) {
+          throw new Error(`Navigation step ${flow.step} has no demonstrated or configured destination URL.`);
+        }
         steps.push({
           id: stepId,
           operation: "NAVIGATE",

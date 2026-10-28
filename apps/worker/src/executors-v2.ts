@@ -5,6 +5,18 @@ import { Stagehand, CustomOpenAIClient } from "@browserbasehq/stagehand";
 import OpenAI from "openai";
 import { translateToEnglish, getMultiLingualSynonyms } from "./language-translator.js";
 import { hitlBus, type HitlAuthResolution } from "./hitl-bus.js";
+import { resolveTarget, describeTarget, checkOutcome, type UnresolvedTarget } from "./target-resolver.js";
+
+/** True when both URLs belong to the same site (equal hosts or one a subdomain of the other). */
+function sameSite(a: string, b: string): boolean {
+  try {
+    const ha = new URL(a).hostname.replace(/^www./, "");
+    const hb = new URL(b).hostname.replace(/^www./, "");
+    return ha === hb || ha.endsWith(`.${hb}`) || hb.endsWith(`.${ha}`);
+  } catch {
+    return false;
+  }
+}
 
 async function dismissKnownPopups(page: any) {
   try {
@@ -30,6 +42,19 @@ export class V2BrowserExecutor implements ExecutionCapability {
     private onSessionReady?: (session: BrowserbaseSession) => Promise<void>,
     private persistence?: any
   ) { }
+
+  /** Escalates an unresolved target with the live page state instead of acting on a guess. */
+  private async unresolvedTarget(step: WorkflowV2Step, resolution: UnresolvedTarget): Promise<ExecutionResult> {
+    const url = this.page?.url?.() || "";
+    const title = await this.page?.title?.().catch(() => "") || "";
+    const reason = resolution.reason === "AMBIGUOUS" ? "TARGET_AMBIGUOUS" : resolution.reason === "NO_TARGET" ? "TARGET_NOT_SPECIFIED" : "TARGET_NOT_RESOLVED";
+    return {
+      state: "PAUSED_FOR_HUMAN",
+      hitlReason: reason,
+      message: `${step.description}: ${resolution.detail} Current page: ${title || url}. No other control was used in its place.`,
+      outputs: { page_state: { url, title }, target_resolution: resolution }
+    } as any;
+  }
 
   private async capturePageOutputs(context: RuntimeContext, operation: string): Promise<Record<string, any>> {
     const outputs: Record<string, any> = {};
@@ -329,7 +354,7 @@ export class V2BrowserExecutor implements ExecutionCapability {
       delete (resolution as any).username;
 
       // Multi-strategy robust login form submission:
-      // (1) Invoke jQuery form submission if available so custom inline cryptographic handlers (e.g. SVKM portal RSA encryption) execute
+      // Invoke the page's own form submission handler so application-level validation and encoding run.
       await this.page.evaluate(() => {
         try {
           const w = window as any;
@@ -493,21 +518,33 @@ export class V2BrowserExecutor implements ExecutionCapability {
   async execute(step: WorkflowV2Step, context: RuntimeContext): Promise<ExecutionResult> {
     try {
       if (!this.session) {
-        this.session = await this.provider.createSession();
-        let targetNavUrl = "about:blank";
-        if (step.target === "BROWSER_DETERMINISTIC" && step.operation === "NAVIGATE") {
-          let candidate = step.args?.url;
-          const inputUrl = context.getState().inputs.url || context.getState().inputs.targetUrl || context.getState().inputs['target_url'] || context.getState().inputs['{{url}}'];
-          if (!candidate || candidate === "{{url}}" || (candidate.includes("localhost") && inputUrl && !inputUrl.includes("localhost")) || (candidate.includes("auth.services.adobe.com") && inputUrl && !inputUrl.includes("auth.services.adobe.com"))) {
-            candidate = inputUrl || candidate;
-          }
-          if (candidate && !candidate.startsWith("http://") && !candidate.startsWith("https://") && !candidate.startsWith("about:")) {
-            candidate = "https://" + candidate;
-          }
-          if (candidate) targetNavUrl = candidate;
-        } else {
-          targetNavUrl = context.getState().inputs.url || context.getState().inputs.targetUrl || context.getState().inputs['target_url'] || context.getState().inputs['{{url}}'] || "about:blank";
+        // A resumed run whose browser session is gone cannot continue mid-page: fields filled before the
+        // pause no longer exist, so acting now could commit incomplete data.
+        if (step.operation !== "NAVIGATE" && context.getBrowserContext().currentUrl) {
+          return {
+            state: "PAUSED_FOR_HUMAN",
+            hitlReason: "RESUME_CONTEXT_LOST",
+            message: `The browser session for this run ended while it was paused, so the page state needed for "${step.description}" is gone. Restart the run or complete this step manually.`
+          } as any;
         }
+        const inputs = context.getState().inputs;
+        const runtimeDestination = inputs.url || inputs.targetUrl || inputs["target_url"] || inputs["{{url}}"];
+        const stepDestination = step.target === "BROWSER_DETERMINISTIC" && step.operation === "NAVIGATE"
+          ? step.args?.url
+          : undefined;
+        const rawDestination = stepDestination && stepDestination !== "{{url}}" ? stepDestination : runtimeDestination;
+        const targetNavUrl = typeof rawDestination === "string"
+          ? (/^https?:\/\//i.test(rawDestination) ? rawDestination : `https://${rawDestination}`)
+          : "";
+        if (!targetNavUrl || !/^https?:\/\//i.test(targetNavUrl) || targetNavUrl.includes("{{")) {
+          return {
+            state: "PAUSED_FOR_HUMAN",
+            hitlReason: "DESTINATION_NOT_ESTABLISHED",
+            message: "This browser workflow has no demonstrated or configured destination URL. Provide the correct application URL before execution."
+          } as any;
+        }
+
+        this.session = await this.provider.createSession();
         const connected = await this.provider.navigate(this.session, targetNavUrl);
         this.browser = connected.browser;
         this.page = connected.page;
@@ -519,24 +556,29 @@ export class V2BrowserExecutor implements ExecutionCapability {
 
       if (step.target === "BROWSER_DETERMINISTIC") {
         if (step.operation === "NAVIGATE") {
-          let targetUrl = step.args?.url;
-          const inputUrl = context.getState().inputs.url || context.getState().inputs.targetUrl || context.getState().inputs['target_url'] || context.getState().inputs['{{url}}'];
-          if (!targetUrl || targetUrl === "{{url}}" || (targetUrl.includes("localhost") && inputUrl && !inputUrl.includes("localhost")) || (targetUrl.includes("auth.services.adobe.com") && inputUrl && !inputUrl.includes("auth.services.adobe.com"))) {
-            targetUrl = inputUrl || targetUrl || "about:blank";
+          const inputs = context.getState().inputs;
+          let targetUrl: string | undefined = step.args?.url;
+          if (!targetUrl || /\{\{.*\}\}/.test(targetUrl)) {
+            const templated = targetUrl && /\{\{\s*([a-zA-Z0-9_.]+)\s*\}\}/.exec(targetUrl);
+            const provided = templated ? inputs[templated[1]!] : undefined;
+            targetUrl = typeof provided === "string" ? provided : undefined;
           }
-          if (targetUrl && !targetUrl.startsWith("http://") && !targetUrl.startsWith("https://") && !targetUrl.startsWith("about:")) {
-            targetUrl = "https://" + targetUrl;
+          if (targetUrl && !/^https?:\/\//i.test(targetUrl)) targetUrl = `https://${targetUrl}`;
+          if (!targetUrl) {
+            return {
+              state: "PAUSED_FOR_HUMAN",
+              hitlReason: "DESTINATION_NOT_ESTABLISHED",
+              message: `Step "${step.description}" has no established destination URL. Provide it before continuing.`
+            } as any;
           }
 
           const currentUrl = this.page.url();
           let needsGoto = true;
           try {
-            if (currentUrl && targetUrl && currentUrl !== "about:blank") {
+            if (currentUrl && currentUrl !== "about:blank") {
               const u1 = new URL(currentUrl);
               const u2 = new URL(targetUrl);
-              if (u1.origin === u2.origin && u1.pathname === u2.pathname) {
-                needsGoto = false;
-              }
+              if (u1.origin === u2.origin && u1.pathname === u2.pathname) needsGoto = false;
             }
           } catch (_) {}
 
@@ -544,15 +586,15 @@ export class V2BrowserExecutor implements ExecutionCapability {
             try {
               await this.page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
             } catch (navErr: any) {
-              if (navErr.message?.includes("ERR_NETWORK_CHANGED") || navErr.message?.includes("ERR_CONNECTION_RESET")) {
-                console.warn("Retrying page.goto after transient network change...");
+              const transient = /ERR_NETWORK_CHANGED|ERR_CONNECTION_RESET|Timeout/i.test(navErr.message || "");
+              if (!transient) {
+                return { state: "FAILED", message: `Navigation to ${targetUrl} failed: ${navErr.message}` };
+              }
+              try {
                 await new Promise(r => setTimeout(r, 1000));
                 await this.page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 25000 });
-              } else if (navErr.message?.includes("ERR_CONNECTION_REFUSED") && inputUrl) {
-                console.warn(`Connection refused at ${targetUrl}, falling back to input URL ${inputUrl}`);
-                await this.page.goto(inputUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
-              } else {
-                throw navErr;
+              } catch (retryErr: any) {
+                return { state: "FAILED", message: `Navigation to ${targetUrl} failed after one retry: ${retryErr.message}` };
               }
             }
           }
@@ -561,13 +603,7 @@ export class V2BrowserExecutor implements ExecutionCapability {
           if (navUrlLower.includes("logout") || navUrlLower.includes("signout")) {
             let domain = "";
             try { domain = new URL(this.page.url()).hostname; } catch (_) {}
-            console.log(`[V2BrowserExecutor] Navigated to logout page on ${domain}. Clearing authenticated state.`);
             if (domain) this.authenticatedDomains.delete(domain);
-            for (const d of Array.from(this.authenticatedDomains)) {
-              if (domain && (d.includes(domain) || domain.includes(d) || (d.includes("wikimedia.org") && domain.includes("wikipedia.org")) || (d.includes("wikipedia.org") && domain.includes("wikimedia.org")))) {
-                this.authenticatedDomains.delete(d);
-              }
-            }
           }
 
           // Universal Autonomous Intelligence: Check for dynamic auth barrier on ANY navigated page
@@ -577,599 +613,181 @@ export class V2BrowserExecutor implements ExecutionCapability {
             if (authRes.state !== "SUCCEEDED") return authRes;
           }
 
+          // A redirect to a different site means the environment no longer matches the demonstration.
+          const landed = this.page.url();
+          if (!sameSite(landed, targetUrl)) {
+            return {
+              state: "PAUSED_FOR_HUMAN",
+              hitlReason: "UNEXPECTED_REDIRECT",
+              message: `Navigating to ${targetUrl} ended on ${landed}, a different site than the workflow targets. Confirm the environment before continuing.`
+            } as any;
+          }
+
           const outputs = await this.capturePageOutputs(context, "NAVIGATE");
           return { state: "SUCCEEDED", outputs };
         }
+
         if (step.operation === "TYPE" || (step.operation as string) === "INPUT") {
-          const sel = step.args?.selector || "input";
-          const val = step.args?.value || "";
+          const val = step.args?.value;
           const desc = step.description || "";
-          const lowerDesc = desc.toLowerCase();
-          
+          const target = describeTarget(step);
+          const fieldText = `${target.label || ""} ${target.text || ""} ${target.selector || ""} ${desc}`.toLowerCase();
+          const isCredential = Boolean(step.args?.sensitive) || /pass(word)?|pwd|otp|user ?name|e-?mail|login/.test(fieldText);
+
           let domain = "";
           try { domain = new URL(this.page.url()).hostname; } catch (_) {}
-          const isPassword = sel.toLowerCase().includes("pass") || sel.toLowerCase().includes("pwd") || lowerDesc.includes("pass") || lowerDesc.includes("pwd");
-          const isUsername = sel.toLowerCase().includes("user") || lowerDesc.includes("user") || lowerDesc.includes("email") || lowerDesc.includes("login") || sel.toLowerCase().includes("email") || sel.toLowerCase().includes("login");
-
-          // If session is already authenticated or credentials were provided, gracefully skip redundant login input steps
-          if ((domain && this.authenticatedDomains.has(domain)) || this.submittedAuthPages.has(this.page.url()) || (domain && this.submittedAuthPages.has(domain))) {
-            if (isPassword || isUsername) {
-              console.log(`[V2BrowserExecutor] Skipping redundant auth typing step "${desc}" - credentials already submitted for this flow.`);
-              return { state: "SUCCEEDED", outputs: { skipped: true, reason: "Already provided credentials" } };
-            }
+          // Credentials supplied through HITL for this site are already entered; the demonstrated typing step is satisfied.
+          if (isCredential && ((domain && this.authenticatedDomains.has(domain)) || this.submittedAuthPages.has(this.page.url()) || (domain && this.submittedAuthPages.has(domain)))) {
+            return { state: "SUCCEEDED", outputs: { skipped: true, reason: "Credentials were provided by a human for this site" } };
           }
-
-          // Common Sense Intelligence: If attempting to type into credentials, NEVER type recorded credentials!
-          // Always prompt the human operator via HITL according to what the page presents.
-          if (isPassword || isUsername || !val) {
+          // Recorded credentials are never replayed; a human provides them on the live page.
+          if (isCredential || val === undefined || val === "") {
             const authBarrier = await this.detectAuthBarrier(step, context);
-            if (authBarrier) {
-              return await this.handleAuthBarrier(authBarrier, step, context);
-            }
+            if (authBarrier) return await this.handleAuthBarrier(authBarrier, step, context);
+          }
+          if (val === undefined || val === "") {
+            return {
+              state: "PAUSED_FOR_HUMAN",
+              hitlReason: "MISSING_RUNTIME_VALUE",
+              message: `No value is known for "${target.label || target.text || desc}". Provide it to continue.`
+            } as any;
           }
 
-          let el = null;
+          await dismissKnownPopups(this.page);
+          const resolved = await resolveTarget(this.page, step, "fill");
+          if (!resolved.ok) return this.unresolvedTarget(step, resolved);
           try {
-            await this.page.waitForSelector(sel, { timeout: 3500, state: 'attached' }).catch(() => null);
-            el = await this.page.$(sel);
-          } catch (_) {}
-
-          if (!el) {
-            const cleanKey = sel.replace(/[^a-zA-Z0-9_-]/g, '').toLowerCase();
-            const isPassword = cleanKey.includes("pass") || lowerDesc.includes("pass");
-            const isUsername = cleanKey.includes("user") || lowerDesc.includes("user") || lowerDesc.includes("email") || lowerDesc.includes("login");
-            const isFirstName = cleanKey.includes("first") || lowerDesc.includes("first");
-            const isLastName = cleanKey.includes("last") || lowerDesc.includes("last");
-            const isPostal = cleanKey.includes("postal") || cleanKey.includes("zip") || lowerDesc.includes("postal") || lowerDesc.includes("zip");
-
-            const potentialSelectors = [
-              sel,
-              ...(isPassword ? ["#password", "input[type='password']", "input[name*='pass' i]", "#login", "[data-test='password']"] : []),
-              ...(isUsername ? ["#user-name", "#username", "input[name*='user' i]", "input[name*='login' i]", "[data-test='username']", "input[type='text']"] : []),
-              ...(isFirstName ? ["#first-name", "input[name*='first' i]", "input[name*='firstName' i]", "input[placeholder*='first' i]", "[data-test='firstName']"] : []),
-              ...(isLastName ? ["#last-name", "input[name*='last' i]", "input[name*='lastName' i]", "input[placeholder*='last' i]", "[data-test='lastName']"] : []),
-              ...(isPostal ? ["#postal-code", "input[name*='postal' i]", "input[name*='zip' i]", "input[name*='postalCode' i]", "input[placeholder*='zip' i]", "[data-test='postalCode']"] : []),
-              `input[name*="${cleanKey}" i]`,
-              `input[id*="${cleanKey}" i]`,
-              `input[data-test*="${cleanKey}" i]`,
-              `textarea[name*="${cleanKey}" i]`,
-              `input[placeholder*="${desc.split(' ')[0] || ''}" i]`,
-              `textarea[placeholder*="${desc.split(' ')[0] || ''}" i]`
-            ];
-            for (const s of potentialSelectors) {
-              if (!s || s === "input") continue;
-              try {
-                await this.page.waitForSelector(s, { timeout: 1500, state: 'attached' }).catch(() => null);
-                el = await this.page.$(s);
-                if (el) break;
-              } catch (_) {}
-            }
+            await resolved.locator.fill(String(val), { timeout: 5000 });
+          } catch (fillErr: any) {
+            return { state: "PAUSED_FOR_HUMAN", hitlReason: "INPUT_FAILED", message: `Could not enter a value into "${target.label || target.text}": ${fillErr.message}` } as any;
           }
-
-          if (el) {
-            try {
-              await el.click().catch(() => null);
-              await el.fill(val);
-            } catch (_) {
-              try {
-                await el.evaluate((node: any, v: string) => {
-                  if (node.value !== undefined) node.value = v;
-                  else node.innerText = v;
-                  node.dispatchEvent(new Event('input', { bubbles: true }));
-                  node.dispatchEvent(new Event('change', { bubbles: true }));
-                }, val);
-              } catch (_) {}
-            }
-          } else {
-            // Intelligent sequential input fill: find first empty visible input so we don't overwrite previous fields
-            try {
-              const inputs = await this.page.$$("input:not([type='hidden']):not([type='submit']):not([disabled]), textarea:not([disabled])");
-              let filled = false;
-              for (const input of inputs) {
-                const currentVal = await input.inputValue().catch(() => "");
-                if (!currentVal) {
-                  await input.click().catch(() => null);
-                  await input.fill(val).catch(() => null);
-                  filled = true;
-                  break;
-                }
-              }
-              if (!filled && inputs.length > 0) {
-                await inputs[0].fill(val).catch(() => null);
-              }
-            } catch (_) {}
+          const actual = await resolved.locator.inputValue().catch(() => undefined);
+          if (actual !== undefined && actual !== String(val)) {
+            return { state: "FAILED", message: `The field "${target.label || target.text}" holds "${isCredential ? "***" : actual}" after typing, not the intended value.` };
           }
-          const buffer = await this.page.screenshot().catch(() => null);
-          return { state: "SUCCEEDED", outputs: buffer ? { screenshotUrl: `data:image/png;base64,${buffer.toString('base64')}` } : {} };
+          const outputs = await this.capturePageOutputs(context, "TYPE");
+          return { state: "SUCCEEDED", outputs: { ...outputs, target_strategy: resolved.strategy } };
         }
+
         if (step.operation === "CLICK" || (step.operation as string) === "SUBMIT") {
-          try {
-            const sel = step.args?.selector;
-            const desc = step.description || "";
-            const lowerDesc = desc.toLowerCase();
-            let el = null;
+          const desc = step.description || "";
+          const target = describeTarget(step);
+          const lowerTarget = `${target.text || ""} ${target.label || ""}`.toLowerCase();
 
-            let domain = "";
-            try { domain = new URL(this.page.url()).hostname; } catch (_) {}
-
-            // If session is already authenticated or credentials submitted, gracefully skip redundant login submit steps
-            if (((domain && this.authenticatedDomains.has(domain)) || this.submittedAuthPages.has(this.page.url()) || (domain && this.submittedAuthPages.has(domain))) && (lowerDesc.includes("login") || lowerDesc.includes("sign in") || lowerDesc.includes("continue") || (sel && sel.includes("login")))) {
-              console.log(`[V2BrowserExecutor] Skipping redundant login submit step "${desc}" - session is already authenticated or credentials submitted on ${domain}`);
-              return { state: "SUCCEEDED", outputs: { skipped: true, reason: "Already authenticated" } };
-            }
-
-            // Guard against false success: If this step requires an authenticated app view, but browser is still stuck on login page
-            const currUrlLower = (this.page?.url() || "").toLowerCase();
-            if ((currUrlLower.includes("/usermgmt/login") || currUrlLower.includes("/login")) && this.submittedAuthPages.size > 0) {
-              if (!lowerDesc.includes("login") && !lowerDesc.includes("user") && !lowerDesc.includes("pass")) {
-                console.warn(`[V2BrowserExecutor] Step "${desc}" requires authenticated session, but browser is still on login page ${this.page?.url()}`);
-                await this.page.evaluate(() => {
-                  try {
-                    const w = window as any;
-                    if (w.$ && w.$('#loginForm').length) w.$('#loginForm').submit();
-                  } catch (_) {}
-                }).catch(() => null);
-                await this.page.waitForTimeout(3000);
-                if ((this.page?.url() || "").toLowerCase().includes("/login")) {
-                  return {
-                    state: "FAILED",
-                    message: `Authentication barrier not cleared: Autoworker remained on login page (${this.page?.url()}) and cannot execute "${desc}". Please verify login credentials.`
-                  };
-                }
-              }
-            }
-
-            // Check for dynamic auth barrier (Login form or OTP challenge)
-            const authBarrier = await this.detectAuthBarrier(step, context);
-            if (authBarrier) {
-              return await this.handleAuthBarrier(authBarrier, step, context);
-            }
-
-            // 1. Check for modal popups blocking pointer events
-            await dismissKnownPopups(this.page);
-
-            const isDummySelector = !sel || sel === "body" || sel === "html" || sel === "button, input[type='submit'], a";
-
-            // Check if step is actually a wait/observational step erroneously tagged as CLICK body
-            if (isDummySelector) {
-              const isWaitOrObserve = lowerDesc.startsWith("wait") || 
-                                     lowerDesc.startsWith("inspect") || 
-                                     lowerDesc.startsWith("observe") || 
-                                     lowerDesc.startsWith("determine") || 
-                                     lowerDesc.startsWith("compare") || 
-                                     lowerDesc.startsWith("finish") || 
-                                     lowerDesc.startsWith("repeat") ||
-                                     lowerDesc.includes("locate");
-              if (isWaitOrObserve) {
-                console.log(`[V2BrowserExecutor] Step is observational/wait: "${desc}". Settling page instead of clicking body.`);
-                await this.page.waitForLoadState("domcontentloaded").catch(() => null);
-                await this.page.waitForTimeout(1500);
-                await dismissKnownPopups(this.page);
-                const buffer = await this.page.screenshot();
-                return { state: "SUCCEEDED", outputs: { screenshotUrl: `data:image/png;base64,${buffer.toString('base64')}` } };
-              }
-            }
-
-            // 1. Direct check for selector with auto-wait (skip dummy selectors)
-            if (sel && !isDummySelector) {
-              const candidates = sel.split(",").map((s: string) => s.trim()).filter(Boolean);
-              for (const cand of candidates) {
-                try {
-                  const candidateEl = await this.page.$(cand);
-                  if (candidateEl && (await candidateEl.isVisible().catch(() => true))) {
-                    el = candidateEl;
-                    break;
-                  }
-                } catch (_) {}
-              }
-              if (!el) {
-                try {
-                  await this.page.waitForSelector(sel, { timeout: 2000, state: 'visible' }).catch(() => null);
-                  el = await this.page.$(sel);
-                } catch (_) {}
-              }
-            }
-
-            // 2. Intelligent smart fallbacks
-            if (!el) {
-              const cleanDesc = desc.replace(/^(?:click|press|submit|select|open|add)\s+/i, '').replace(/["'\.]/g, '').trim();
-              const fallbacks: string[] = [];
-
-              // 1. Generate multi-lingual and generic semantic fallbacks
-              const cleanWords = cleanDesc.split(/\s+/).filter(w => w.length > 2);
-              for (const word of cleanWords) {
-                const synonyms = getMultiLingualSynonyms(word);
-                for (const syn of synonyms) {
-                  fallbacks.push(
-                    `a:has-text("${syn}")`,
-                    `button:has-text("${syn}")`,
-                    `[role="button"]:has-text("${syn}")`,
-                    `[role="menuitem"]:has-text("${syn}")`,
-                    `[data-ui-id*="${syn}" i] a`,
-                    `li[class*="${syn}" i] a`,
-                    `a[href*="${syn}" i]`
-                  );
-                }
-              }
-
-              // 2. Generic table / grid row navigation across any e-commerce/SaaS platform
-              const isFirstRow = lowerDesc.includes("first") || lowerDesc.includes("1st") || lowerDesc.includes("open order") || lowerDesc.includes("select order");
-              const isSecondRow = lowerDesc.includes("second") || lowerDesc.includes("2nd") || lowerDesc.includes("other order") || lowerDesc.includes("next order");
-              if (isSecondRow) {
-                fallbacks.push(
-                  `table tbody tr:nth-child(2) a`,
-                  `table tr.data-row:nth-child(2) a`,
-                  `[role="grid"] [role="row"]:nth-child(2) a`,
-                  `[role="rowgroup"] tr:nth-child(2) a`,
-                  `table tbody tr:nth-child(2) td:nth-child(2)`
-                );
-              } else if (isFirstRow) {
-                fallbacks.push(
-                  `table tbody tr:first-child a`,
-                  `table tr.data-row:first-child a`,
-                  `[role="grid"] [role="row"]:first-child a`,
-                  `[role="rowgroup"] tr:first-child a`,
-                  `table tbody tr:first-child td:nth-child(2)`
-                );
-              }
-
-              // 3. Navigation menus & submenus across platforms (Magento, Shopify, custom CRM/ERP)
-              if (lowerDesc.includes("order") || lowerDesc.includes("sales")) {
-                try {
-                  const parentNav = await this.page.$('[id*="sales" i] > a, nav a[href*="sales" i], nav a:has-text("Sales")');
-                  const orderLink = await this.page.$('li[class*="order" i] a, a[href*="order" i], a:has-text("Orders")');
-                  if (parentNav && (!orderLink || !(await orderLink.isVisible()))) {
-                    await parentNav.click();
-                    await this.page.waitForTimeout(400);
-                  }
-                } catch (_) {}
-                fallbacks.push(
-                  `li[class*="order" i] a`,
-                  `a[href*="order" i]`,
-                  `a:has-text("Orders")`,
-                  `[data-ui-id*="sales-order"] a`
-                );
-              }
-
-              // 4. Action buttons with multi-lingual support
-              if (lowerDesc.includes("login") || lowerDesc.includes("sign in") || lowerDesc.includes("zaloguj") || lowerDesc.includes("anmelden")) {
-                fallbacks.push(
-                  `button.action-login`,
-                  `button.action-primary`,
-                  `#login-button`,
-                  `button[type='submit']`,
-                  `input[type='submit']`
-                );
-                for (const s of getMultiLingualSynonyms("login")) {
-                  fallbacks.push(`button:has-text("${s}")`, `input[value*="${s}" i]`);
-                }
-              }
-
-              if (lowerDesc.includes("return") || lowerDesc.includes("back") || lowerDesc.includes("powrót") || lowerDesc.includes("zurück")) {
-                fallbacks.push(
-                  `button#back`,
-                  `[data-ui-id*="back"]`,
-                  `a.back`,
-                  `a[title*="Back" i]`
-                );
-                for (const s of getMultiLingualSynonyms("back")) {
-                  fallbacks.push(`button:has-text("${s}")`, `a:has-text("${s}")`);
-                }
-              }
-
-              if (lowerDesc.includes("dashboard")) {
-                fallbacks.push(
-                  `[id*="dashboard" i] > a`,
-                  `a[href*="dashboard" i]`,
-                  `a:has-text("Dashboard")`
-                );
-              }
-
-              if (sel) {
-                // If selector contains add-to-cart (e.g. on item detail page it is #add-to-cart)
-                if (sel.includes("add-to-cart")) {
-                  fallbacks.push(
-                    `#add-to-cart`,
-                    `[data-test="add-to-cart"]`,
-                    `button[data-test*="add-to-cart"]`,
-                    `button:has-text("Add to cart")`,
-                    `button:has-text("Add")`
-                  );
-                }
-                if (sel.includes("checkout")) {
-                  fallbacks.push(
-                    `#checkout`,
-                    `[data-test="checkout"]`,
-                    `button:has-text("Checkout")`,
-                    `a:has-text("Checkout")`
-                  );
-                }
-                if (sel.includes("continue")) {
-                  fallbacks.push(
-                    `#continue`,
-                    `[data-test="continue"]`,
-                    `input[value*="Continue" i]`,
-                    `button:has-text("Continue")`
-                  );
-                }
-                if (sel.includes("finish")) {
-                  fallbacks.push(
-                    `#finish`,
-                    `[data-test="finish"]`,
-                    `button:has-text("Finish")`
-                  );
-                }
-                if (sel.includes("cart")) {
-                  fallbacks.push(
-                    `.shopping_cart_link`,
-                    `#shopping_cart_container a`,
-                    `[data-test="shopping-cart-link"]`
-                  );
-                }
-                // Try removing specific product suffixes e.g. #add-to-cart-xxx -> #add-to-cart
-                const strippedSel = sel.replace(/-[a-z0-9-]+$/, '');
-                if (strippedSel && strippedSel !== sel && strippedSel !== '#') {
-                  fallbacks.push(strippedSel, `[id*="${strippedSel.replace('#', '')}"]`);
-                }
-              }
-
-              // Description-derived matchers
-              if (lowerDesc.includes("add") && lowerDesc.includes("cart")) {
-                fallbacks.push(
-                  `#add-to-cart`,
-                  `[data-test="add-to-cart"]`,
-                  `button:has-text("Add to cart")`,
-                  `button:has-text("Add")`
-                );
-              }
-              if (lowerDesc.includes("cart")) {
-                fallbacks.push(
-                  `.shopping_cart_link`,
-                  `#shopping_cart_container a`
-                );
-              }
-              if (lowerDesc.includes("checkout")) {
-                fallbacks.push(`#checkout`, `button:has-text("Checkout")`);
-              }
-              if (lowerDesc.includes("continue")) {
-                fallbacks.push(`#continue`, `input[value*="Continue" i]`, `button:has-text("Continue")`);
-              }
-              if (lowerDesc.includes("finish")) {
-                fallbacks.push(`#finish`, `button:has-text("Finish")`);
-              }
-              if (lowerDesc.includes("pdf") || (sel && sel.includes("pdf"))) {
-                fallbacks.push(
-                  `button:has-text("Generate PDF")`,
-                  `button:has-text("PDF")`,
-                  `#generate-pdf`,
-                  `[data-test="generate-pdf"]`,
-                  `a:has-text("PDF")`,
-                  `button:has-text("Download")`
-                );
-                try {
-                  const hasPdf = await this.page.$('button:has-text("Generate PDF"), button:has-text("PDF"), #generate-pdf, [data-test="generate-pdf"]');
-                  if (!hasPdf) {
-                    await this.page.evaluate(() => {
-                      const btn = document.createElement('button');
-                      btn.id = 'generate-pdf';
-                      btn.className = 'btn btn_secondary';
-                      btn.textContent = 'Generate PDF order';
-                      btn.style.cssText = 'padding: 10px; margin-left: 10px; border: 1px solid black; background: white; cursor: pointer;';
-                      btn.onclick = () => {
-                        const blob = new Blob(['%PDF-1.4 Mock Swag Labs Order PDF'], { type: 'application/pdf' });
-                        const url = URL.createObjectURL(blob);
-                        const a = document.createElement('a');
-                        a.href = url;
-                        a.download = `swag-labs-order-${new Date().toISOString().replace(/:/g, '-')}.pdf`;
-                        a.click();
-                      };
-                      const backBtn = document.querySelector('#back-to-products, button');
-                      if (backBtn && backBtn.parentElement) {
-                        backBtn.parentElement.appendChild(btn);
-                      } else {
-                        document.body.appendChild(btn);
-                      }
-                    });
-                  }
-                } catch (_) {}
-              }
-
-              fallbacks.push(
-                `button:has-text("${cleanDesc}")`,
-                `a:has-text("${cleanDesc}")`,
-                `span:has-text("${cleanDesc}")`,
-                `label:has-text("${cleanDesc}")`,
-                `[aria-label*="${cleanDesc}" i]`,
-                `[role='button']:has-text("${cleanDesc}")`,
-                `input[type='submit'][value*="${cleanDesc}" i]`,
-                `input[value*="${cleanDesc}" i]`,
-                `button[type='submit']`,
-                `input[type='submit']`
-              );
-
-              for (const f of fallbacks) {
-                if (!f) continue;
-                try {
-                  el = await this.page.$(f);
-                  if (el) {
-                    console.log(`[V2BrowserExecutor] Resolved fallback locator for ${sel || desc} -> ${f}`);
-                    break;
-                  }
-                } catch (_) {}
-              }
-            }
-
-            if (el) {
-              const tagName = await el.evaluate((n: HTMLElement) => n.tagName.toUpperCase()).catch(() => "");
-              if (tagName === "SELECT") {
-                try {
-                  const selectSuccess = await el.evaluate((selEl: HTMLSelectElement, d: string) => {
-                    const options = Array.from(selEl.options);
-                    const match = options.find(o => 
-                      o.text.toLowerCase().includes("semester v") || 
-                      o.text.toLowerCase().includes("semester") ||
-                      o.value.toLowerCase().includes("sem") ||
-                      (d.toLowerCase().includes("semester") && o.text.toLowerCase().includes("semester"))
-                    ) || (options.length > 1 ? options[1] : null);
-                    if (match) {
-                      selEl.value = match.value;
-                      selEl.dispatchEvent(new Event("change", { bubbles: true }));
-                      selEl.dispatchEvent(new Event("input", { bubbles: true }));
-                      return true;
-                    }
-                    return false;
-                  }, desc).catch(() => false);
-                  if (!selectSuccess) {
-                    await el.click({ timeout: 2000 }).catch(() => null);
-                  }
-                } catch (_) {}
-              } else {
-                try {
-                  await el.click({ timeout: 4000 });
-                } catch (clickErr) {
-                  console.log(`[V2BrowserExecutor] Standard click failed (${clickErr}), retrying with force and DOM dispatch`);
-                  try {
-                    await el.click({ force: true, timeout: 2000 });
-                  } catch (_) {
-                    await el.evaluate((node: HTMLElement) => {
-                      if (node.scrollIntoView) node.scrollIntoView();
-                      node.click();
-                    });
-                  }
-                }
-              }
-            } else if (sel && !isDummySelector) {
-              try {
-                const loc = this.page.locator(sel).first();
-                await loc.click({ timeout: 3000 });
-              } catch (clickErr) {
-                try {
-                  const loc = this.page.locator(sel).first();
-                  await loc.click({ force: true, timeout: 2000 });
-                } catch (_) {
-                  try {
-                    const loc = this.page.locator(sel).first();
-                    await loc.evaluate((node: HTMLElement) => {
-                      if (node.scrollIntoView) node.scrollIntoView();
-                      node.click();
-                    });
-                  } catch (_) {}
-                }
-              }
-            } else {
-              const defaultBtn = await this.page.$("button[type='submit'], input[type='submit'], button");
-              if (defaultBtn) {
-                await defaultBtn.click({ timeout: 3000 }).catch(() => defaultBtn.click({ force: true }).catch(() => null));
-              }
-            }
-
-            // Proper settling based on action type
-            const isNavigational = lowerDesc.includes("login") || 
-                                  lowerDesc.includes("sign in") || 
-                                  lowerDesc.includes("sales") || 
-                                  lowerDesc.includes("order") || 
-                                  lowerDesc.includes("dashboard") || 
-                                  lowerDesc.includes("admin") || 
-                                  lowerDesc.includes("pim") || 
-                                  lowerDesc.includes("leave") || 
-                                  lowerDesc.includes("time") || 
-                                  lowerDesc.includes("recruitment") || 
-                                  lowerDesc.includes("my info") || 
-                                  lowerDesc.includes("performance") || 
-                                  lowerDesc.includes("back") || 
-                                  lowerDesc.includes("return") || 
-                                  sel?.includes("login") || 
-                                  sel?.includes("oxd-main-menu-item") || 
-                                  sel?.includes("action-login");
-            if (isNavigational) {
-              await Promise.race([
-                this.page.waitForLoadState("networkidle", { timeout: 4000 }).catch(() => null),
-                this.page.waitForTimeout(2000)
-              ]);
-              await dismissKnownPopups(this.page);
-            } else {
-              await this.page.waitForTimeout(800);
-            }
-
-            const isLogout = lowerDesc.includes("logout") || lowerDesc.includes("log out") || lowerDesc.includes("sign out") || lowerDesc.includes("signout") || (sel && (sel.includes("logout") || sel.includes("signout") || sel.includes("userlogout")));
-            if (isLogout) {
-              console.log(`[V2BrowserExecutor] Executed logout on ${domain}. Clearing authenticated state.`);
-              if (domain) this.authenticatedDomains.delete(domain);
-              for (const d of Array.from(this.authenticatedDomains)) {
-                if (domain && (d.includes(domain) || domain.includes(d) || (d.includes("wikimedia.org") && domain.includes("wikipedia.org")) || (d.includes("wikipedia.org") && domain.includes("wikimedia.org")))) {
-                  this.authenticatedDomains.delete(d);
-                }
-              }
-            }
-
-            const outputs = await this.capturePageOutputs(context, "CLICK");
-            return { state: "SUCCEEDED", outputs };
-          } catch (e) {
-            let domainName = "";
-            try { domainName = new URL(this.page?.url() || "").hostname; } catch (_) {}
-            const elementDesc = step.description || step.args?.selector || "target action element";
-            const cleanReason = `Action obstacle on ${domainName || "the active page"}: The autoworker could not find or interact with "${elementDesc}". The element layout may have shifted, require scrolling into view, or is not yet visible.`;
-            return { state: "PAUSED_FOR_HUMAN", hitlReason: cleanReason, message: cleanReason } as any;
+          let domain = "";
+          try { domain = new URL(this.page.url()).hostname; } catch (_) {}
+          // The sign-in submit of a demonstrated login is satisfied once a human signed in for this site.
+          if (((domain && this.authenticatedDomains.has(domain)) || this.submittedAuthPages.has(this.page.url()) || (domain && this.submittedAuthPages.has(domain))) &&
+              /\b(log ?in|sign ?in)\b/.test(lowerTarget)) {
+            return { state: "SUCCEEDED", outputs: { skipped: true, reason: "Already authenticated by a human operator" } };
           }
+
+          const authBarrier = await this.detectAuthBarrier(step, context);
+          if (authBarrier) {
+            return await this.handleAuthBarrier(authBarrier, step, context);
+          }
+
+          await dismissKnownPopups(this.page);
+          const resolved = await resolveTarget(this.page, step, "click");
+          if (!resolved.ok) return this.unresolvedTarget(step, resolved);
+
+          const urlBefore = this.page.url();
+          try {
+            await resolved.locator.click({ timeout: 5000 });
+          } catch (clickErr: any) {
+            try {
+              await resolved.locator.scrollIntoViewIfNeeded({ timeout: 2000 });
+              await resolved.locator.click({ timeout: 4000 });
+            } catch (retryErr: any) {
+              return {
+                state: "PAUSED_FOR_HUMAN",
+                hitlReason: "CLICK_FAILED",
+                message: `"${target.text || target.label || desc}" was found but could not be clicked (${retryErr.message || clickErr.message}). Nothing was clicked in its place.`
+              } as any;
+            }
+          }
+
+          await Promise.race([
+            this.page.waitForLoadState("domcontentloaded", { timeout: 4000 }).catch(() => null),
+            this.page.waitForTimeout(1500)
+          ]);
+          await dismissKnownPopups(this.page);
+
+          if (/\b(log ?out|sign ?out)\b/.test(lowerTarget) && domain) {
+            this.authenticatedDomains.delete(domain);
+          }
+
+          const outputs = await this.capturePageOutputs(context, "CLICK");
+          return { state: "SUCCEEDED", outputs: { ...outputs, target_strategy: resolved.strategy, url_before: urlBefore } };
         }
+
         if (step.operation === "SELECT" || (step.operation as string) === "CHOOSE") {
-          const sel = step.args?.selector || "select";
-          const val = step.args?.value || step.args?.option || step.args?.text || "";
+          const val = step.args?.value || step.args?.option || "";
+          const target = describeTarget(step);
+          if (!val) {
+            return { state: "PAUSED_FOR_HUMAN", hitlReason: "SELECT_VALUE_MISSING", message: `No demonstrated option was recorded for "${target.label || target.text || step.description}".` } as any;
+          }
+          const resolved = await resolveTarget(this.page, step, "select");
+          if (!resolved.ok) return this.unresolvedTarget(step, resolved);
+          const expected = String(val).trim().toLowerCase();
           try {
-            await this.page.waitForSelector(sel, { timeout: 4000, state: 'attached' }).catch(() => null);
-            const selectEl = await this.page.$(sel);
-            if (selectEl) {
-              await this.page.selectOption(sel, { label: val }).catch(async () => {
-                await this.page.selectOption(sel, { value: val }).catch(async () => {
-                  await selectEl.click().catch(() => null);
-                  const opt = await this.page.$(`option:has-text('${val}'), li:has-text('${val}')`);
-                  if (opt) await opt.click().catch(() => null);
-                });
-              });
-            }
-            const outputs = await this.capturePageOutputs(context, "SELECT");
-            return { state: "SUCCEEDED", outputs };
+            await resolved.locator.selectOption({ label: String(val) }, { timeout: 4000 })
+              .catch(() => resolved.locator.selectOption({ value: String(val) }, { timeout: 4000 }));
           } catch (e: any) {
-            console.warn(`[V2BrowserExecutor] SELECT non-fatal warning:`, e.message);
-            const outputs = await this.capturePageOutputs(context, "SELECT");
-            return { state: "SUCCEEDED", outputs };
+            return { state: "PAUSED_FOR_HUMAN", hitlReason: "SELECT_FAILED", message: `Could not choose "${val}": ${e.message}` } as any;
           }
+          const selectedMatches = await resolved.locator.evaluate((node: HTMLSelectElement, wanted: string) => {
+            const option = node.selectedOptions?.[0];
+            return Boolean(option && (option.label.trim().toLowerCase() === wanted || option.value.trim().toLowerCase() === wanted));
+          }, expected).catch(() => false);
+          if (!selectedMatches) {
+            return { state: "PAUSED_FOR_HUMAN", hitlReason: "SELECT_OPTION_NOT_RESOLVED", message: `The option "${val}" is not available in "${target.label || target.text}".` } as any;
+          }
+          const outputs = await this.capturePageOutputs(context, "SELECT");
+          return { state: "SUCCEEDED", outputs };
         }
-        if (step.operation === "EXTRACT") {
-          let selector = step.args?.selector || "body";
-          const lowerDesc = (step.description || "").toLowerCase();
-          if (lowerDesc.includes("overview") || lowerDesc.includes("total") || lowerDesc.includes("summary")) {
-            selector = `${selector}, .summary_total_label, .summary_info, #checkout_summary_container`;
-          } else if (selector === "body") {
-            if (lowerDesc.includes("order") || lowerDesc.includes("zamówien") || lowerDesc.includes("bestell") || lowerDesc.includes("command")) {
-              selector = ".page-title, .order-view-account-information, .order-totals, .order-information, [data-test*='order'], main";
-            }
+
+        if (step.operation === "PRESS_KEY") {
+          const key = String(step.args?.key || "Enter");
+          const target = describeTarget(step);
+          if (target.text || target.label || target.selector) {
+            const resolved = await resolveTarget(this.page, step, "fill");
+            if (!resolved.ok) return this.unresolvedTarget(step, resolved);
+            await resolved.locator.press(key, { timeout: 4000 });
+          } else {
+            await this.page.keyboard.press(key);
           }
+          await this.page.waitForLoadState("domcontentloaded", { timeout: 4000 }).catch(() => null);
+          const outputs = await this.capturePageOutputs(context, "PRESS_KEY");
+          return { state: "SUCCEEDED", outputs };
+        }
+
+        if (step.operation === "SCROLL") {
+          const target = describeTarget(step);
+          if (target.text || target.label || target.selector) {
+            const resolved = await resolveTarget(this.page, step, "read");
+            if (!resolved.ok) return this.unresolvedTarget(step, resolved);
+            await resolved.locator.scrollIntoViewIfNeeded({ timeout: 4000 });
+          } else {
+            await this.page.mouse.wheel(0, 600);
+          }
+          return { state: "SUCCEEDED" };
+        }
+
+        if (step.operation === "EXTRACT") {
+          const target = describeTarget(step);
           let text = "";
-          try {
-            const locs = this.page.locator(selector);
-            const count = await locs.count().catch(() => 0);
-            if (count > 1) {
-              const texts = await locs.allInnerTexts().catch(() => []);
-              text = texts.filter((t: string) => t && t.trim().length > 0).join("\n");
-            } else if (count === 1) {
-              text = (await locs.first().innerText({ timeout: 3000 }).catch(() => "")) || "";
-            } else {
-              text = (await this.page.locator("body").innerText({ timeout: 3000 }).catch(() => "")) || "";
-            }
-          } catch (_) {
-            // Fallback: look for instruction text on page
-            if (step.args?.instruction) {
-              const instr = step.args.instruction;
-              try {
-                const textLoc = this.page.locator(`text="${instr}"`).first();
-                text = (await textLoc.innerText({ timeout: 2000 }).catch(() => instr)) || instr;
-              } catch (_) {
-                text = step.args.instruction;
-              }
-            } else {
-              text = (await this.page.locator("body").innerText({ timeout: 2000 }).catch(() => "")) || "";
-            }
+          let scope = "PAGE";
+          if (target.text || target.label || target.selector) {
+            const resolved = await resolveTarget(this.page, step, "read", { timeoutMs: 6000 });
+            if (!resolved.ok) return this.unresolvedTarget(step, resolved);
+            text = (await resolved.locator.innerText({ timeout: 3000 }).catch(() => "")) || "";
+            scope = resolved.strategy;
+          } else {
+            text = (await this.page.locator("body").innerText({ timeout: 3000 }).catch(() => "")) || "";
+          }
+          if (!text.trim()) {
+            return { state: "FAILED", message: `Nothing readable was found for "${step.description}".` };
           }
 
           // Multi-language normalization: detect non-English text and translate to English
@@ -1182,19 +800,40 @@ export class V2BrowserExecutor implements ExecutionCapability {
               ...(step.bind_result_to ? {
                 [step.bind_result_to]: translation.translated,
                 [`${step.bind_result_to}_raw`]: translation.original,
-                [`${step.bind_result_to}_lang`]: translation.detectedLanguage
+                [`${step.bind_result_to}_lang`]: translation.detectedLanguage,
+                [`${step.bind_result_to}_source_url`]: this.page.url(),
+                [`${step.bind_result_to}_step_id`]: step.id
               } : {}),
               extractedText: translation.translated,
               originalLanguageText: translation.original,
               detectedLanguage: translation.detectedLanguage,
               translatedToEnglish: translation.wasTranslated,
               sourceUrl: this.page.url(),
-              selector: selector
+              extractionScope: scope
             }
           };
         }
+
+        if (step.operation === "VERIFY" || step.operation === "ASSERT") {
+          const criteria = Array.isArray(step.args?.criteria) ? step.args!.criteria : [];
+          if (!criteria.length) {
+            return { state: "FAILED", message: `Verification step "${step.description}" has no checkable condition.` };
+          }
+          const result = await checkOutcome(this.page, criteria);
+          const buffer = await this.page.screenshot().catch(() => null);
+          const outputs = {
+            outcome_verification: { ...result, checkedAt: new Date().toISOString(), url: this.page.url() },
+            ...(buffer ? { screenshotUrl: `data:image/png;base64,${buffer.toString("base64")}` } : {})
+          };
+          if (!result.verified) {
+            const failed = result.checks.filter(c => !c.passed).map(c => `${c.type} "${c.expected}" (${c.observed})`).join("; ");
+            return { state: "FAILED", message: `OUTCOME_NOT_MET: ${failed}`, outputs };
+          }
+          return { state: "SUCCEEDED", outputs };
+        }
+
         if (step.operation === "WAIT") {
-          await this.page.waitForTimeout(step.args?.timeout || 500);
+          await this.page.waitForTimeout(Math.min(Number(step.args?.timeout) || 500, 30000));
           const buffer = await this.page.screenshot().catch(() => null);
           return {
             state: "SUCCEEDED",
@@ -1244,13 +883,6 @@ export class V2BrowserExecutor implements ExecutionCapability {
         if (step.operation === "CLICK" || step.operation === "ACT") {
           try {
             const instruction = step.description || step.args?.instruction || "Click the element";
-            if (instruction.includes("Sort low to high")) {
-              console.log("Mocking Stagehand act for SauceDemo sort due to no API credits");
-              await this.page.locator('.product_sort_container').selectOption('lohi');
-              const buffer = await this.page.screenshot();
-              return { state: "SUCCEEDED", outputs: { screenshotUrl: `data:image/png;base64,${buffer.toString('base64')}` } };
-            }
-
             await this.stagehand.act(instruction);
             // Return screenshot just like deterministic interactions
             const buffer = await this.page.screenshot();

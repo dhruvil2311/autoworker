@@ -12,6 +12,7 @@ export type OpenRouterErrorType =
   | "AI_QUOTA_EXHAUSTED"
   | "COST_GUARD_VIOLATION"
   | "MALFORMED_OUTPUT"
+  | "OUTPUT_TRUNCATED"
   | "UNKNOWN_ERROR";
 
 export class OpenRouterError extends Error {
@@ -80,6 +81,11 @@ export interface SemanticEvidencePacket {
   confidence: number;
   timestamps: { start: number; end: number };
   keyFrames?: FrameEvidence[] | undefined;
+  /** Timestamped OCR lines for this packet's time range (preferred over the flat ocrFacts list). */
+  timedOcr?: Array<{ text: string; timestamp?: number | undefined; frameId?: string | undefined }> | undefined;
+  /** Summary of actions already reconstructed from earlier segments of the same recording. */
+  precedingActions?: Array<{ action: string; target?: string | undefined; value?: string | undefined }> | undefined;
+  segment?: { index: number; total: number } | undefined;
 }
 
 export const SemanticActionSchema = z.object({
@@ -87,30 +93,16 @@ export const SemanticActionSchema = z.object({
   arguments: z.record(z.any()).default({}),
   application: z.string().default("Browser"),
   evidenceEpisodeIds: z.array(z.string()).default([]),
-  confidence: z.number().min(0).max(1).default(0.85),
-  evidenceStatus: z.enum(["OBSERVED", "INFERRED", "UNKNOWN"]).default("OBSERVED"),
+  confidence: z.number().min(0).max(1).default(0),
+  // An action the model did not explicitly mark as observed is not treated as observed.
+  evidenceStatus: z.enum(["OBSERVED", "INFERRED", "UNKNOWN"]).default("UNKNOWN"),
   rationale: z.string().optional()
 });
 
 export type SemanticAction = z.infer<typeof SemanticActionSchema>;
 
-export const SemanticActionsResultSchema = z.object({
-  semanticActions: z.array(SemanticActionSchema).default([]),
-  discardedNoise: z.array(z.string()).default([])
-});
-
-export type SemanticActionsResult = z.infer<typeof SemanticActionsResultSchema>;
-
-export interface ProcessReasoningContext {
-  objective?: string | undefined;
-  variables?: Array<{ name: string; type: string; exampleValue?: any }> | undefined;
-  uncertainties?: string[] | undefined;
-  tenantId?: string | undefined;
-  workerId?: string | undefined;
-}
-
 export const ProcessUnderstandingResultSchema = z.object({
-  taskIntent: z.string().default("Unknown Business Task"),
+  taskIntent: z.string().default(""),
   applicationEnvironment: z.string().default("Web Browser"),
   processStructure: z.object({
     type: z.enum(["LINEAR", "LOOP", "CONDITIONAL"]).default("LINEAR"),
@@ -143,6 +135,24 @@ export const ProcessUnderstandingResultSchema = z.object({
 });
 
 export type ProcessUnderstandingResult = z.infer<typeof ProcessUnderstandingResultSchema>;
+
+export const SemanticActionsResultSchema = z.object({
+  semanticActions: z.array(SemanticActionSchema).default([]),
+  discardedNoise: z.array(z.string()).default([]),
+  /** Things the model saw but could not interpret; surfaced to the user, never dropped. */
+  unresolved: z.array(z.string()).default([]),
+  processUnderstanding: ProcessUnderstandingResultSchema.optional()
+});
+
+export type SemanticActionsResult = z.infer<typeof SemanticActionsResultSchema>;
+
+export interface ProcessReasoningContext {
+  objective?: string | undefined;
+  variables?: Array<{ name: string; type: string; exampleValue?: any }> | undefined;
+  uncertainties?: string[] | undefined;
+  tenantId?: string | undefined;
+  workerId?: string | undefined;
+}
 
 export interface CriticResult {
   passed: boolean;

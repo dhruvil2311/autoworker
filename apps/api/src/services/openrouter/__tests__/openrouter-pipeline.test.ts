@@ -163,7 +163,52 @@ describe("OpenRouter Evidence Pipeline & Deterministic CV Engine", () => {
       ALLOW_PAID_MODELS: "false"
     });
 
-    it("compiles workflow successfully using MockVisionProvider without calling external API", async () => {
+    it("does not invent navigation or verification actions from an empty extraction", () => {
+      const pipeline = new EvidenceToWorkflowPipeline(config, new MockVisionProvider());
+      const demo = pipeline.toNormalizedDemonstration([], {
+        taskIntent: "Update a record",
+        applicationEnvironment: "Web Browser",
+        processStructure: { type: "LINEAR", stepIndices: [] },
+        variables: [],
+        businessRules: [],
+        expectedOutcomes: [],
+        exceptions: [],
+        confidence: 0.5
+      }, { jobId: "empty-job", mediaName: "empty.webm", tenantId: "tenant-a", ocrFacts: [{ text: "https://example.test" }] });
+
+      expect(demo.observations).toEqual([]);
+    });
+
+    it("prefers the complete OCR-visible subdomain over a lossy model URL", () => {
+      const pipeline = new EvidenceToWorkflowPipeline(config, new MockVisionProvider());
+      const demo = pipeline.toNormalizedDemonstration([{
+        action: "NAVIGATE",
+        arguments: { url: "https://google.com/document/d/abc" },
+        application: "Browser",
+        evidenceEpisodeIds: ["ep_01"],
+        confidence: 0.99,
+        evidenceStatus: "OBSERVED",
+        rationale: "Model transcription"
+      }], {
+        taskIntent: "Open the spreadsheet",
+        applicationEnvironment: "Web Browser",
+        processStructure: { type: "LINEAR", stepIndices: [0] },
+        variables: [],
+        businessRules: [],
+        expectedOutcomes: [],
+        exceptions: [],
+        confidence: 0.9
+      }, {
+        jobId: "url-host-regression",
+        mediaName: "fulfillment.webm",
+        tenantId: "tenant-a",
+        ocrFacts: [{ text: "docs.google.com/spreadsheets/d/abc123/edit" }]
+      });
+
+      expect(demo.observations[0]?.context.url).toBe("https://docs.google.com/spreadsheets/d/abc123/edit");
+    });
+
+    it("blocks compilation when grounded evidence leaves blocking process gaps", async () => {
       const mockProvider = new MockVisionProvider();
       const pipeline = new EvidenceToWorkflowPipeline(config, mockProvider);
 
@@ -210,14 +255,15 @@ describe("OpenRouter Evidence Pipeline & Deterministic CV Engine", () => {
         activeApplication: "Browser"
       });
 
-      expect(result.success).toBe(true);
-      expect(result.status).toBe("COMPLETED");
-      expect(result.workflow).toBeDefined();
+      expect(result.success).toBe(false);
+      expect(result.status).toBe("NEEDS_CLARIFICATION");
+      expect(result.workflow).toBeUndefined();
+      // Blocking items come either from BPI gaps or from the evidence-grounding gate.
+      const blockingItems = (result.provenance?.blockingGaps?.length ?? 0) + (result.grounding?.issues.filter(i => i.severity === "BLOCKING").length ?? 0);
+      expect(blockingItems).toBeGreaterThan(0);
       expect(result.semanticActions).toBeDefined();
       expect(result.semanticActions!.length).toBeGreaterThan(0);
-      expect(result.workflow?.workflow_version).toBe("2.0");
       expect(result.provenance?.jobId).toBe("test_job_101");
-      expect((result.workflow?.compiler as any)?.source_type).toBe("OPENROUTER_SEMANTIC_EVIDENCE");
     });
 
     it("returns AI_QUOTA_EXHAUSTED without generating a fake workflow when quota fails", async () => {

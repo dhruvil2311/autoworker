@@ -26,33 +26,36 @@ export interface RelevanceScore {
 }
 
 export class TaskRelevanceEngine {
-  private static readonly NOISE_PATTERNS = [
-    // Browser noise
-    /^https?:\/\//i, // static raw address bar unless navigation
-    /new tab/i,
-    /bookmark/i,
+  /** The recording tool itself; never part of the task. */
+  private static readonly RECORDER_PATTERNS = [
     /is sharing your screen/i,
     /stop sharing/i,
-    /autoworker/i,
+    /\bautoworker\b/i,
     /localhost:5173/i,
     /localhost:4000/i,
     /spatial floor/i,
-    /command room/i,
-    /live session/i,
-    /roadmap/i,
-    // Desktop noise
-    /taskbar/i,
+    /command room/i
+  ];
+
+  /**
+   * Operating-system chrome. Matched only for passive observations or shell applications, so a
+   * deliberate click on "Clock in" or "Volume discount" in a business application is kept.
+   */
+  private static readonly OS_CHROME_PATTERNS = [
+    /\btaskbar\b/i,
     /system tray/i,
-    /notification/i,
     /recycle bin/i,
     /desktop wallpaper/i,
     /start menu/i,
     /windows search/i,
-    /clock/i,
-    /battery/i,
-    /wi-fi/i,
-    /volume/i,
-    /action center/i
+    /action center/i,
+    /\bnew tab\b/i,
+    /\bbookmarks? bar\b/i,
+    /\bclock\b/i,
+    /\bbattery\b/i,
+    /\bwi-?fi\b/i,
+    /\bvolume\b/i,
+    /\bnotifications?\b/i
   ];
 
   /**
@@ -91,19 +94,30 @@ export class TaskRelevanceEngine {
 
     const label = `${obs.targetText || ""} ${obs.targetDescription || ""} ${obs.windowTitle || ""}`.trim();
 
-    // 1. Check Noise Patterns
-    for (const pattern of TaskRelevanceEngine.NOISE_PATTERNS) {
+    // 1. Recording-tool UI is always noise.
+    for (const pattern of TaskRelevanceEngine.RECORDER_PATTERNS) {
       if (pattern.test(label)) {
-        return {
-          observationId: obs.id,
-          relevance: "NOISE",
-          score: 0,
-          reason: `Matched visual noise pattern: ${pattern}`
-        };
+        return { observationId: obs.id, relevance: "NOISE", score: 0, reason: `Recording tool interface: ${pattern}` };
       }
     }
 
-    // 2. Interaction heuristics
+    // 2. A navigation is a task step; its address is the evidence, not address-bar noise.
+    if (/navigate/i.test(obs.type || "") && /^https?:\/\//i.test(obs.targetText || obs.value || "")) {
+      return { observationId: obs.id, relevance: "HIGH", score: 60, reason: "Navigation to a demonstrated address" };
+    }
+
+    // 3. Operating-system chrome, unless the user deliberately interacted with a business application.
+    const interacted = Boolean(obs.isClickTarget || obs.isTextMutation || (obs.value && obs.value.length > 0));
+    const shellApp = /^(explorer|desktop|windows|shell|system|taskbar)$/i.test(obs.application || "");
+    if (!interacted || shellApp) {
+      for (const pattern of TaskRelevanceEngine.OS_CHROME_PATTERNS) {
+        if (pattern.test(label)) {
+          return { observationId: obs.id, relevance: "NOISE", score: 0, reason: `Operating-system chrome: ${pattern}` };
+        }
+      }
+    }
+
+    // 4. Interaction heuristics
     if (obs.isClickTarget) {
       score += 50;
       reasons.push("Click target");
@@ -125,13 +139,13 @@ export class TaskRelevanceEngine {
       reasons.push("Data input demonstrated");
     }
 
-    // 3. Application context alignment
+    // 5. Application context alignment
     if (context.activeApp && obs.application && obs.application.toLowerCase() === context.activeApp.toLowerCase()) {
       score += 15;
       reasons.push("Matches active foreground application");
     }
 
-    // 4. Down-rank static passive UI without interactions
+    // 6. Down-rank static passive UI without interactions
     if (!obs.isClickTarget && !obs.isTextMutation && !obs.isPointerTarget && !obs.value) {
       score -= 30;
       reasons.push("Passive untouched UI");

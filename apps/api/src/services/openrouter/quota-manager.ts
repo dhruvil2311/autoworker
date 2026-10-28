@@ -38,15 +38,19 @@ export class OpenRouterQuotaManager {
     allowPaidModels: false,
     maxConcurrentRequests: 1,
     maxRequestsPerMinute: 20,
-    maxRequestsPerDay: 500,
+    maxRequestsPerDay: 50, // OpenRouter free-tier daily model quota is 50 requests/day
     maxRetries: 1,
-    circuitBreakerThreshold: 3,
+    circuitBreakerThreshold: 2,
     circuitBreakerCooldownMs: 60_000
   };
 
   public constructor(configOverride?: Partial<QuotaConfig>) {
     if (configOverride) {
-      this.config = { ...this.config, ...configOverride };
+      this.config = {
+        ...this.config,
+        ...configOverride,
+        maxRequestsPerDay: configOverride.maxRequestsPerDay ?? (configOverride.allowPaidModels ? 500 : 50)
+      };
     }
     this.resetDailyCounterIfNeeded();
   }
@@ -158,6 +162,34 @@ export class OpenRouterQuotaManager {
   }
 
   /**
+   * Waits (bounded) for a concurrency or per-minute slot instead of failing a second concurrent
+   * job immediately. Circuit-breaker and daily-budget exhaustion still fail fast.
+   */
+  public async acquireSlotWithWait(maxWaitMs: number = 30_000, pollMs: number = 250): Promise<void> {
+    const deadline = Date.now() + maxWaitMs;
+    for (;;) {
+      try {
+        this.acquireSlot();
+        return;
+      } catch (err: any) {
+        const transient = err instanceof OpenRouterError && err.type === "RATE_LIMITED" && !this.isCircuitOpen();
+        if (!transient || Date.now() + pollMs > deadline) throw err;
+        await new Promise(r => setTimeout(r, pollMs));
+      }
+    }
+  }
+
+  /** Releases a slot without counting a failure (used before honouring a short Retry-After). */
+  public releaseSlot(): void {
+    this.activeRequests = Math.max(0, this.activeRequests - 1);
+  }
+
+  /** Honour a provider-supplied cooldown so no request is sent before it elapses. */
+  public applyCooldown(ms: number): void {
+    if (ms > 0) this.circuitBreakerOpenUntil = Math.max(this.circuitBreakerOpenUntil, Date.now() + ms);
+  }
+
+  /**
    * Release execution slot and record success.
    */
   public recordSuccess(tokensEstimate?: number): void {
@@ -170,6 +202,15 @@ export class OpenRouterQuotaManager {
 
   public isCircuitOpen(): boolean {
     return Date.now() < this.circuitBreakerOpenUntil;
+  }
+
+  public isAvailable(): boolean {
+    const now = Date.now();
+    this.resetDailyCounterIfNeeded();
+    if (now < this.circuitBreakerOpenUntil) return false;
+    if (this.dailyRequestCount >= this.config.maxRequestsPerDay) return false;
+    if (this.minuteRequestTimestamps.filter(t => now - t < 60_000).length >= this.config.maxRequestsPerMinute) return false;
+    return true;
   }
 
   public getActiveRequests(): number {
@@ -191,7 +232,11 @@ export class OpenRouterQuotaManager {
   /**
    * Release execution slot and record failure.
    */
-  public recordFailure(statusCodeOrError?: number | OpenRouterError | Error, errorMessage?: string): void {
+  /**
+   * modelScoped: the failure concerns one model (e.g. a 5xx from its host), so only the consecutive-failure
+   * threshold may open the account-wide breaker; another configured model can still be tried.
+   */
+  public recordFailure(statusCodeOrError?: number | OpenRouterError | Error, errorMessage?: string, options: { modelScoped?: boolean } = {}): void {
     this.activeRequests = Math.max(0, this.activeRequests - 1);
     this.consecutiveFailures++;
 
@@ -207,11 +252,25 @@ export class OpenRouterQuotaManager {
       message = statusCodeOrError.message;
     }
 
+    const isDailyQuotaExhausted = message?.toLowerCase().includes("free-models-per-day") ||
+      message?.toLowerCase().includes("daily") ||
+      (statusCode === 429 && message?.toLowerCase().includes("exceeded"));
+
+    if (isDailyQuotaExhausted) {
+      this.dailyRequestCount = this.config.maxRequestsPerDay;
+      this.circuitBreakerOpenUntil = Date.now() + Math.max(this.config.circuitBreakerCooldownMs, 15 * 60_000);
+      logger.warn(
+        { statusCode, error: message },
+        "OpenRouter daily free-model quota exhausted. Pausing outbound OpenRouter requests and defaulting to local CV reasoning."
+      );
+      return;
+    }
+
     // Trip circuit breaker on repeated 429, 402, or 5xx failures
     if (
       statusCode === 429 ||
       statusCode === 402 ||
-      (statusCode && statusCode >= 500) ||
+      (statusCode && statusCode >= 500 && !options.modelScoped) ||
       this.consecutiveFailures >= this.config.circuitBreakerThreshold
     ) {
       this.circuitBreakerOpenUntil = Date.now() + this.config.circuitBreakerCooldownMs;

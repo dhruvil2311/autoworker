@@ -157,7 +157,7 @@ export function WorkerWorkstation() {
     setRunningNow(true);
     setRunError(null);
     try {
-      const res = await api.runWorker(worker?.id || id);
+      const res = await api.runWorker(worker?.id || id, worker?.activeVersionId, worker?.trainingSource?.jobId || worker?.recordingId);
       if (res?.run?.id) {
         setActiveRunId(res.run.id);
         setActiveTab('live');

@@ -1,8 +1,10 @@
 import * as path from "path";
 import * as fs from "fs";
+import { createHash } from "crypto";
 import { logger } from "@ghost/observability";
-import type { NormalizedDemonstration, Observation } from "@ghost/bpi";
+import type { NormalizedDemonstration, Observation, VariableClassification, ProcessStructure } from "@ghost/bpi";
 import { BusinessProcessIntelligence } from "@ghost/bpi";
+import type { SemanticBPIProvider } from "@ghost/bpi/dist/ai.js";
 import { WorkflowCompiler } from "../../compiler.js";
 import { RealSemanticBPIProvider } from "../../ai-provider.js";
 import type { WorkflowV2 } from "@ghost/workflow-schema";
@@ -11,39 +13,168 @@ import {
   type VisionReasoningProvider,
   type SemanticEvidencePacket,
   type SemanticAction,
+  type SemanticActionsResult,
   type ProcessUnderstandingResult,
   type EvidenceEpisode,
   type FrameEvidence,
   type OcrFact,
   OpenRouterError
 } from "../openrouter/types.js";
-import { OpenRouterProvider } from "../openrouter/openrouter-provider.js";
+import { OpenRouterProvider, SEMANTIC_EXTRACTION_PROMPT_VERSION } from "../openrouter/openrouter-provider.js";
 import { FrameSampler } from "./frame-sampler.js";
 import { TaskRelevanceEngine, type RawVisualObservation } from "./task-relevance-engine.js";
-import { EvidenceEpisodeBuilder } from "./evidence-episode-builder.js";
+import { EvidenceEpisodeBuilder, dedupeOcr } from "./evidence-episode-builder.js";
+import {
+  groundSemanticActions,
+  refineUrlWithOcr,
+  normalizeText,
+  type GroundedAction,
+  type GroundingReport
+} from "./grounding.js";
+
+/** Keep the complete host and path shown in evidence; never reduce a subdomain to its registrable domain. */
+export function extractUrlCandidates(text: string): string[] {
+  const candidates = new Set<string>();
+  const urlPattern = /(?:https?:\/\/)?(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}(?::\d+)?(?:\/[a-z0-9._~:/?#[\]@!$&'()*+,;=%-]*)?/ig;
+  for (const match of text.matchAll(urlPattern)) {
+    let candidate = match[0].replace(/[.,;:!?)]+$/g, "");
+    if (!/^https?:\/\//i.test(candidate)) candidate = `https://${candidate}`;
+    try {
+      const parsed = new URL(candidate);
+      if (parsed.hostname.includes(".")) candidates.add(parsed.toString().replace(/\/$/, parsed.pathname === "/" && !candidate.endsWith("/") ? "" : "/"));
+    } catch { /* Ignore malformed OCR fragments. */ }
+  }
+  return [...candidates];
+}
 
 export interface PipelineExecutionOptions {
   jobId: string;
   mediaPath: string;
   tenantId: string;
   workerId?: string | undefined;
+  /** Objective stated by the user. Authoritative; never inferred from heuristics. */
   taskObjective?: string | undefined;
+  /** Non-authoritative context shown to the model (for example a local CV summary). */
+  taskContextHint?: string | undefined;
   rawObservations?: RawVisualObservation[] | undefined;
   rawFrames?: Array<{ frameId: string; timestamp: number; filePath: string }> | undefined;
   ocrFacts?: OcrFact[] | undefined;
   activeApplication?: string | undefined;
+  /** Directory where completed model segments are stored so an interrupted analysis can resume. */
+  checkpointDir?: string | undefined;
 }
 
 export interface PipelineExecutionResult {
   success: boolean;
-  status: "COMPLETED" | "AI_QUOTA_EXHAUSTED" | "ANALYSIS_FAILED" | "NEEDS_RETRY";
+  status: "COMPLETED" | "AI_QUOTA_EXHAUSTED" | "ANALYSIS_FAILED" | "NEEDS_RETRY" | "NEEDS_CLARIFICATION";
   message: string;
   workflow?: WorkflowV2 | undefined;
   semanticActions?: SemanticAction[] | undefined;
   processUnderstanding?: ProcessUnderstandingResult | undefined;
   evidencePacket?: SemanticEvidencePacket | undefined;
+  grounding?: GroundingReport | undefined;
   provenance?: Record<string, any> | undefined;
+  /** True when completed stages were persisted and a retry can continue from them. */
+  resumable?: boolean | undefined;
   error?: string | undefined;
+}
+
+/**
+ * Deterministic BPI provider that injects precomputed multimodal/local understanding
+ * directly into BPI without making ANY external LLM requests.
+ */
+export class PrecomputedSemanticBPIProvider implements SemanticBPIProvider {
+  constructor(private understanding: ProcessUnderstandingResult) {}
+
+  async inferBusinessIntent(): Promise<{ intent: string; confidence: number; reasoning: string }> {
+    return {
+      intent: this.understanding.taskIntent || "",
+      confidence: this.understanding.confidence ?? 0.5,
+      reasoning: "Precomputed from multimodal demonstration analysis"
+    };
+  }
+
+  async inferEntities(targets: Record<number, any>): Promise<Record<number, { name: string; confidence: number; reasoning: string }>> {
+    const res: Record<number, { name: string; confidence: number; reasoning: string }> = {};
+    for (const [k, v] of Object.entries(targets)) {
+      const seq = parseInt(k, 10);
+      const name = v?.dom_evidence?.name || v?.name || v?.text;
+      if (typeof name !== "string" || !name.trim()) continue;
+      res[seq] = {
+        name: name.trim().slice(0, 100),
+        confidence: 0.5,
+        reasoning: "Derived from interaction target"
+      };
+    }
+    return res;
+  }
+
+  async classifyAmbiguousValues(
+    values: Record<string, string>,
+    _context: string
+  ): Promise<Record<string, { classification: VariableClassification; type: "string" | "number" | "boolean" | "date"; semantic_role: string; confidence: number; reasoning: string }>> {
+    const res: Record<string, any> = {};
+    const knownVars = this.understanding.variables || [];
+    for (const [k, v] of Object.entries(values)) {
+      const match = knownVars.find(kv => kv.name === k || kv.semanticRole === k);
+      const strVal = String(v || "");
+      let inferredType: "string" | "number" | "boolean" | "date" = (match?.type as any) || "string";
+      if (!match) {
+        if (/^\d+(\.\d+)?$/.test(strVal)) inferredType = "number";
+        else if (/^(true|false)$/i.test(strVal)) inferredType = "boolean";
+        else if (!isNaN(Date.parse(strVal)) && strVal.length > 5) inferredType = "date";
+      }
+
+      res[k] = {
+        classification: (match?.classification as VariableClassification) || "RUNTIME_VARIABLE",
+        type: inferredType,
+        semantic_role: match?.semanticRole || k,
+        confidence: 0.5,
+        reasoning: "Precomputed variable classification"
+      };
+    }
+    return res;
+  }
+
+  async inferProcessStructure(events: Observation[] | any[]): Promise<{ structure: ProcessStructure; confidence: number; reasoning: string }> {
+    const rawType = String(this.understanding.processStructure?.type || "LINEAR").toUpperCase();
+    const type = (rawType.includes("LOOP") ? "LOOP" : (rawType.includes("CONDITIONAL") ? "CONDITIONAL" : "LINEAR")) as "LINEAR" | "LOOP" | "CONDITIONAL";
+    return {
+      structure: {
+        type,
+        steps: (events as any[]).map(e => e.sequence)
+      },
+      confidence: this.understanding.confidence ?? 0.5,
+      reasoning: "Precomputed process structure"
+    };
+  }
+
+  async inferPotentialBusinessRules(): Promise<string[]> {
+    return (this.understanding.businessRules || []).map(r => typeof r === "string" ? r : r.rule).filter(Boolean);
+  }
+
+  async identifySemanticAmbiguities(): Promise<string[]> {
+    return (this.understanding.exceptions || []).map(e => typeof e === "string" ? e : `${e.triggerCondition}: ${e.fallbackAction}`).filter(Boolean);
+  }
+}
+
+const BPI_ACTION: Record<string, Observation["action"]> = {
+  NAVIGATE: "NAVIGATE",
+  CLICK: "CLICK",
+  TYPE: "INPUT",
+  SELECT: "INPUT",
+  KEYPRESS: "KEYBOARD",
+  EXTRACT: "EXTRACT",
+  VERIFY: "EXTRACT",
+  WAIT: "WAIT",
+  SCROLL: "WAIT",
+  UNSUPPORTED: "CLICK"
+};
+
+interface SegmentCheckpoint {
+  key: string;
+  result: SemanticActionsResult;
+  completedAt: string;
 }
 
 export class EvidenceToWorkflowPipeline {
@@ -64,140 +195,251 @@ export class EvidenceToWorkflowPipeline {
   }
 
   /**
-   * Complete deterministic local evidence extraction -> OpenRouter reasoning -> BPI -> Workflow compilation.
+   * Local evidence extraction -> segmented vision reasoning -> grounding -> BPI -> workflow compilation.
+   * Each stage's losses (dropped frames, discarded noise, uncovered transitions) are reported in provenance.
    */
   public async executePipeline(options: PipelineExecutionOptions): Promise<PipelineExecutionResult> {
-    const { jobId, mediaPath, tenantId, workerId, taskObjective, activeApplication } = options;
+    const { jobId, mediaPath, tenantId, workerId, activeApplication } = options;
+    const userObjective = (options.taskObjective || "").trim();
     const mediaName = path.basename(mediaPath);
 
-    logger.info({ jobId, mediaPath }, "[EvidencePipeline] Starting deterministic evidence-to-workflow compilation");
+    logger.info({ jobId, mediaPath }, "[EvidencePipeline] Starting evidence-to-workflow compilation");
 
     try {
-      // 1. Stage 1: Local Computer Vision & Frame Extraction / Sampling
+      // Stage 1: frames
       let rawFrames = options.rawFrames || [];
+      let extractionReport: Record<string, any> | undefined;
       if (!rawFrames.length && options.mediaPath && fs.existsSync(options.mediaPath)) {
-        const outDir = path.resolve("./evidence_output", tenantId, jobId);
+        const outDir = options.checkpointDir ? path.dirname(options.checkpointDir) : path.resolve("./evidence_output", tenantId, jobId);
         rawFrames = this.frameSampler.extractFramesFromMedia(options.mediaPath, outDir);
+        extractionReport = this.frameSampler.lastExtractionReport;
+        if (!rawFrames.length) {
+          return {
+            success: false,
+            status: "ANALYSIS_FAILED",
+            message: extractionReport?.error || "No frames could be extracted from the uploaded media; it may be corrupt or in an unsupported format.",
+            provenance: { jobId, mediaName, extraction: extractionReport }
+          };
+        }
       }
       const sampledFrames: FrameEvidence[] = this.frameSampler.sampleAndDeduplicateFrames(rawFrames);
+      const samplingReport = this.frameSampler.lastSamplingReport;
 
-      // 2. Stage 2: Task Relevance Filtering (Strip visual noise, inactive tabs, wallpaper)
+      // Stage 2: relevance filtering
       const { relevant: relevantObservations, discarded: discardedNoise } = this.relevanceEngine.filterTaskRelevantObservations(
         options.rawObservations || [],
         { activeApp: activeApplication }
       );
 
-      // 3. Stage 3: Evidence Episode Construction (Before/Action/After packets)
+      // Stage 3: before/action/after episodes
+      const contextText = [userObjective, options.taskContextHint].filter(Boolean).join(" | ");
+      const ocrFacts = options.ocrFacts || [];
       const episodes: EvidenceEpisode[] = this.episodeBuilder.buildEpisodes(
         relevantObservations,
         sampledFrames,
-        options.ocrFacts || [],
-        { activeApp: activeApplication, taskContext: taskObjective }
+        ocrFacts,
+        { activeApp: activeApplication, taskContext: contextText }
       );
 
       if (!episodes.length && !sampledFrames.length) {
         return {
           success: false,
           status: "ANALYSIS_FAILED",
-          message: "No meaningful visual state changes or interaction evidence detected in recording."
+          message: "No meaningful visual state changes or interaction evidence detected in recording.",
+          provenance: { jobId, mediaName, extraction: extractionReport, sampling: samplingReport }
         };
       }
 
-      // 4. Stage 4: Package Semantic Evidence Packet
       const evidencePacket: SemanticEvidencePacket = this.episodeBuilder.packageEvidencePacket(
         episodes,
-        options.ocrFacts || [],
-        { activeApp: activeApplication, taskContext: taskObjective }
+        ocrFacts,
+        { activeApp: activeApplication, taskContext: contextText }
       );
       evidencePacket.keyFrames = sampledFrames;
 
-      logger.info(
-        { jobId, episodesCount: episodes.length, framesSampled: sampledFrames.length },
-        "[EvidencePipeline] Dispatching Call #1: Semantic Action Extraction via OpenRouter"
-      );
-
-      // 5. Stage 5: OpenRouter Call #1 — Semantic Action Extraction
-      let semanticActionsResult;
-      try {
-        semanticActionsResult = await this.provider.extractSemanticActions(evidencePacket);
-      } catch (err: any) {
-        return this.handleProviderError(err, "Semantic action extraction failed");
-      }
-
-      const semanticActions = semanticActionsResult.semanticActions;
-      if (!semanticActions.length) {
+      // Stage 4: segmented vision reasoning
+      const perRequest = Math.max(1, this.config.maxLlmImagesPerRequest || 6);
+      const segments = this.buildSegments(evidencePacket, sampledFrames, perRequest);
+      const maxSegments = this.config.maxSegmentsPerVideo || 20;
+      if (segments.length > maxSegments) {
         return {
           success: false,
           status: "ANALYSIS_FAILED",
-          message: "OpenRouter semantic analysis could not identify any task-relevant actions in the provided evidence."
+          message: `This recording needs ${segments.length} analysis segments but the configured budget is ${maxSegments} (MAX_SEGMENTS_PER_VIDEO). Nothing was compiled; raise the budget or provide a shorter recording.`,
+          provenance: { jobId, mediaName, segmentsRequired: segments.length, segmentBudget: maxSegments, sampling: samplingReport }
         };
       }
 
-      logger.info(
-        { jobId, actionsExtracted: semanticActions.length },
-        "[EvidencePipeline] Dispatching Call #2: Task Process Compilation via OpenRouter"
-      );
+      const mediaFingerprint = this.fingerprintMedia(mediaPath, jobId);
+      const merged: SemanticAction[] = [];
+      const discarded: string[] = [];
+      const unresolved: string[] = [];
+      const boundaryMerges: Array<{ segment: number; action: string; target?: string }> = [];
+      let lastUnderstanding: ProcessUnderstandingResult | undefined;
+      let reusedSegments = 0;
 
-      // 6. Stage 6: OpenRouter Call #2 — Process Understanding & Task Compilation
-      let processUnderstanding: ProcessUnderstandingResult;
-      try {
-        processUnderstanding = await this.provider.compileProcessUnderstanding(semanticActions, {
-          objective: taskObjective,
-          tenantId,
-          workerId
-        });
-      } catch (err: any) {
-        return this.handleProviderError(err, "Process understanding compilation failed");
+      for (let i = 0; i < segments.length; i++) {
+        const segment = segments[i]!;
+        segment.segment = { index: i, total: segments.length };
+        segment.precedingActions = merged.slice(-8).map(a => ({ action: a.action, target: a.arguments?.target, value: a.arguments?.value }));
+        const key = this.segmentKey(segment, mediaFingerprint);
+        let result = this.loadSegment(options.checkpointDir, i, key);
+        if (result) {
+          reusedSegments++;
+        } else {
+          logger.info({ jobId, segment: i + 1, of: segments.length, frames: segment.keyFrames?.length, episodes: segment.episodes.length }, "[EvidencePipeline] Semantic action extraction");
+          try {
+            result = await this.provider.extractSemanticActions(segment);
+          } catch (err: any) {
+            const failure = this.handleProviderError(err, `Semantic action extraction failed on segment ${i + 1} of ${segments.length}`);
+            failure.resumable = Boolean(options.checkpointDir) && i > 0;
+            failure.provenance = { jobId, mediaName, completedSegments: i, totalSegments: segments.length, reusedSegments };
+            return failure;
+          }
+          this.saveSegment(options.checkpointDir, i, key, result);
+        }
+
+        // The first action of a segment may repeat the last one of the previous segment. It is merged only
+        // when it carries no new evidence from this segment; a genuinely repeated action is kept.
+        const segmentEvidence = new Set([...segment.episodes.map(e => e.episodeId), ...(segment.keyFrames || []).map(f => f.frameId)]);
+        for (const action of result.semanticActions) {
+          const prev = merged[merged.length - 1];
+          const citesThisSegment = (action.evidenceEpisodeIds || []).some(id => segmentEvidence.has(id));
+          const sharesEvidence = (action.evidenceEpisodeIds || []).some(id => (prev?.evidenceEpisodeIds || []).includes(id));
+          if (prev && i > 0 && this.isFirstOfSegment(result, action) && this.sameAction(prev, action) && (sharesEvidence || !citesThisSegment)) {
+            boundaryMerges.push({ segment: i, action: action.action, target: action.arguments?.target });
+            prev.evidenceEpisodeIds = Array.from(new Set([...(prev.evidenceEpisodeIds || []), ...(action.evidenceEpisodeIds || [])]));
+            continue;
+          }
+          merged.push(action);
+        }
+        discarded.push(...(result.discardedNoise || []));
+        unresolved.push(...(result.unresolved || []));
+        if (result.processUnderstanding) lastUnderstanding = result.processUnderstanding;
       }
 
-      // 7. Stage 7: Translate Semantic Actions to BPI NormalizedDemonstration
-      const demo = this.toNormalizedDemonstration(semanticActions, processUnderstanding, {
+      if (!merged.length) {
+        return {
+          success: false,
+          status: "NEEDS_CLARIFICATION",
+          message: "The recording was analysed, but no task actions could be identified in it. Nothing was compiled.",
+          evidencePacket,
+          provenance: { jobId, mediaName, segments: segments.length, unresolved, discardedNoise: discarded, sampling: samplingReport }
+        };
+      }
+
+      // Stage 5: process understanding over the complete action list
+      let processUnderstanding: ProcessUnderstandingResult;
+      if (segments.length === 1 && lastUnderstanding) {
+        processUnderstanding = lastUnderstanding;
+      } else {
+        try {
+          processUnderstanding = await this.provider.compileProcessUnderstanding(merged, { objective: userObjective, tenantId, workerId });
+        } catch (err: any) {
+          const failure = this.handleProviderError(err, "Process understanding compilation failed");
+          failure.resumable = Boolean(options.checkpointDir);
+          failure.semanticActions = merged;
+          failure.provenance = { jobId, mediaName, completedSegments: segments.length, totalSegments: segments.length, reusedSegments };
+          return failure;
+        }
+      }
+
+      // Stage 6: grounding (deterministic; separates observation from interpretation)
+      const citedFrameIds = sampledFrames.map(f => f.frameId);
+      const grounding = groundSemanticActions({
+        actions: merged,
+        packet: evidencePacket,
+        ocrFacts,
+        userObjective,
+        modelObjective: processUnderstanding.taskIntent,
+        discardedNoise: discarded,
+        citedFrameIds
+      });
+
+      const provenance: Record<string, any> = {
         jobId,
         mediaName,
-        tenantId,
-        ocrFacts: options.ocrFacts
-      });
+        extraction: extractionReport,
+        sampling: samplingReport,
+        episodesCount: episodes.length,
+        segments: segments.length,
+        reusedSegments,
+        boundaryMerges,
+        semanticActionsCount: merged.length,
+        discardedNoise: discarded,
+        discardedObservations: discardedNoise.length,
+        unresolved,
+        coverage: grounding.coverage
+      };
 
-      // 8. Stage 8: Hand off to authoritative BPI (Business Process Intelligence)
-      const aiProvider = new RealSemanticBPIProvider(this.config);
-      const bpi = new BusinessProcessIntelligence(aiProvider as any);
+      if (grounding.blocking) {
+        return {
+          success: false,
+          status: "NEEDS_CLARIFICATION",
+          message: "The recording was interpreted, but some actions are not supported by the evidence or required details are missing. Resolve the listed items; no workflow was compiled.",
+          semanticActions: merged,
+          processUnderstanding,
+          evidencePacket,
+          grounding,
+          provenance
+        };
+      }
+
+      // Stage 7: BPI on grounded actions
+      const demo = this.demonstrationFromGrounding(grounding, processUnderstanding, ocrFacts, { jobId, tenantId });
+      const bpiProvider = new PrecomputedSemanticBPIProvider({ ...processUnderstanding, taskIntent: grounding.objective.text });
+      const bpi = new BusinessProcessIntelligence(bpiProvider as any);
       const bpiResult = await bpi.processDemonstration(demo);
 
-      // 9. Stage 9: Hand off to authoritative WorkflowCompiler
+      const blockingGaps = bpiResult.specification.unresolvedGaps.filter(gap => gap.blocking);
+      if (blockingGaps.length > 0 || bpiResult.specification.status === "NEEDS_CLARIFICATION") {
+        return {
+          success: false,
+          status: "NEEDS_CLARIFICATION",
+          message: "Evidence was interpreted, but required workflow details remain unresolved. Clarify the blocking items before compilation.",
+          semanticActions: merged,
+          processUnderstanding,
+          evidencePacket,
+          grounding,
+          provenance: { ...provenance, blockingGaps }
+        };
+      }
+
+      // Stage 8: compile; the compiler preserves every grounded action and adds approval gates.
+      const aiProvider = new RealSemanticBPIProvider(this.config);
       const compiler = new WorkflowCompiler(aiProvider);
       const compiledWorkflow = await compiler.compile(bpiResult.specification, {
-        version: "openrouter-evidence-compiler-1.0"
+        version: "openrouter-evidence-compiler-2.0",
+        evidenceSourced: true,
+        grounding
       });
 
-      // Attach rigorous provenance directly to workflow compiler node
-      (compiledWorkflow.compiler as any).source_type = "OPENROUTER_SEMANTIC_EVIDENCE";
-      (compiledWorkflow.compiler as any).source_recording_id = jobId;
-      (compiledWorkflow.compiler as any).source_media_name = mediaName;
-      (compiledWorkflow.compiler as any).action_count = semanticActions.length;
-      (compiledWorkflow.compiler as any).frame_count = sampledFrames.length;
-      (compiledWorkflow.compiler as any).compiled_from = `Evidence Demonstration: ${mediaName}`;
-      (compiledWorkflow.compiler as any).process_understanding = processUnderstanding;
+      Object.assign(compiledWorkflow.compiler as any, {
+        source_type: "OPENROUTER_SEMANTIC_EVIDENCE",
+        source_recording_id: jobId,
+        source_media_name: mediaName,
+        action_count: merged.length,
+        frame_count: sampledFrames.length,
+        compiled_from: `Evidence Demonstration: ${mediaName}`,
+        process_understanding: processUnderstanding,
+        evidence_provenance: provenance
+      });
 
       logger.info(
-        { jobId, stepsCount: compiledWorkflow.root_step?.children?.length },
-        "[EvidencePipeline] Workflow successfully compiled from evidence"
+        { jobId, stepsCount: compiledWorkflow.root_step?.children?.length, fidelity: grounding.coverage.fidelity },
+        "[EvidencePipeline] Workflow compiled from evidence"
       );
 
       return {
         success: true,
         status: "COMPLETED",
-        message: `Workflow compiled successfully from evidence (${semanticActions.length} semantic actions, ${sampledFrames.length} keyframes).`,
+        message: `Workflow compiled from evidence (${merged.length} actions, ${sampledFrames.length} keyframes, coverage ${grounding.coverage.fidelity}).`,
         workflow: compiledWorkflow,
-        semanticActions,
+        semanticActions: merged,
         processUnderstanding,
         evidencePacket,
-        provenance: {
-          jobId,
-          mediaName,
-          episodesCount: episodes.length,
-          semanticActionsCount: semanticActions.length,
-          discardedNoiseCount: discardedNoise.length
-        }
+        grounding,
+        provenance
       };
     } catch (err: any) {
       logger.error({ jobId, err: err.message }, "[EvidencePipeline] Unexpected pipeline exception");
@@ -239,6 +481,15 @@ export class EvidenceToWorkflowPipeline {
       };
     }
 
+    if (err instanceof OpenRouterError && ["TIMEOUT", "PROVIDER_ERROR", "SERVICE_UNAVAILABLE", "OUTPUT_TRUNCATED", "MALFORMED_OUTPUT"].includes(err.type)) {
+      return {
+        success: false,
+        status: "NEEDS_RETRY",
+        message: `${prefix}: ${err.message}`,
+        error: `${err.type}: ${err.message}`
+      };
+    }
+
     return {
       success: false,
       status: "ANALYSIS_FAILED",
@@ -247,231 +498,117 @@ export class EvidenceToWorkflowPipeline {
     };
   }
 
-  /**
-   * Converts high-level semantic actions and process understanding into a canonical BPI NormalizedDemonstration.
-   */
-  public toNormalizedDemonstration(
-    semanticActions: SemanticAction[],
-    processUnderstanding: ProcessUnderstandingResult,
-    context: { 
-      jobId: string; 
-      mediaName: string; 
-      tenantId: string; 
-      ocrFacts?: Array<{ text: string }> | undefined;
-      rawObservations?: RawVisualObservation[] | undefined;
-    }
-  ): NormalizedDemonstration {
-    const isBrowser = processUnderstanding.applicationEnvironment.toLowerCase().includes("browser") ||
-      processUnderstanding.applicationEnvironment.toLowerCase().includes("web");
-
-    // 1. Identify target navigation URL from actions, OCR facts, or process understanding
-    let defaultUrl = "";
-    for (const act of semanticActions) {
-      if (act.arguments?.url && typeof act.arguments.url === "string" && act.arguments.url.startsWith("http")) {
-        defaultUrl = act.arguments.url;
-        break;
-      }
-    }
-
-    if (!defaultUrl) {
-      const allText = [
-        context.mediaName,
-        processUnderstanding.taskIntent,
-        ...(processUnderstanding.businessRules || []),
-        ...(context.ocrFacts || []).map((f: any) => f.text || "")
-      ].join(" ");
-      const urlMatch = allText.match(/https?:\/\/[a-zA-Z0-9\.\-_]+(?::\d+)?(?:[a-zA-Z0-9\.\/_\-\?=&%#]+)?/i);
-      if (urlMatch) {
-        defaultUrl = urlMatch[0];
-      }
-    }
-
-    if (!defaultUrl) {
-      const combinedContext = `${context.mediaName} ${processUnderstanding.taskIntent} ${JSON.stringify(processUnderstanding.businessRules || [])} ${JSON.stringify(semanticActions)}`.toLowerCase();
-      if (combinedContext.includes("svkm") || combinedContext.includes("nmims") || combinedContext.includes("usermgmt")) {
-        defaultUrl = "https://portal.svkm.ac.in/usermgmt/login";
-      } else if (combinedContext.includes("orangehrm") || combinedContext.includes("orange hrm")) {
-        defaultUrl = "https://opensource-demo.orangehrmlive.com/web/index.php/auth/login";
-      } else if (combinedContext.includes("saucedemo") || combinedContext.includes("sauce demo")) {
-        defaultUrl = "https://www.saucedemo.com/";
-      } else if (combinedContext.includes("fulfillment") || combinedContext.includes("auditor") || combinedContext.includes("warehouse") || combinedContext.includes("inventory") || combinedContext.includes("order")) {
-        defaultUrl = "https://portal.svkm.ac.in/usermgmt/login";
-      } else if (combinedContext.includes("amazon")) {
-        defaultUrl = "https://www.amazon.com/s?k=ergonomic+mouse";
-      } else {
-        defaultUrl = "https://portal.svkm.ac.in/usermgmt/login";
-      }
-    }
-
-    // 2. Filter pre-task noise actions (e.g. clicking extension buttons or opening tabs before portal navigation)
-    const NOISE_PATTERN = /autoworker|ask gemini|new tab|retail worker|sharing your screen|localhost:5173/i;
-    let filteredActions = semanticActions.filter(act => {
-      const text = `${act.action} ${act.arguments?.target || ""} ${act.arguments?.name || ""} ${act.rationale || ""}`.toLowerCase();
-      return !NOISE_PATTERN.test(text);
-    });
-
-    // 3. Ensure navigation to the target URL is the initial action
-    const hasNav = filteredActions.some(act => 
-      act.action.toUpperCase().includes("NAVIGATE") || 
-      act.action.toUpperCase().includes("OPEN_URL") || 
-      act.arguments?.url
-    );
-
-    if (isBrowser && !hasNav && defaultUrl) {
-      filteredActions.unshift({
-        action: "NAVIGATE",
-        arguments: { url: defaultUrl },
-        application: "Browser",
-        evidenceEpisodeIds: [],
-        confidence: 1.0,
-        evidenceStatus: "OBSERVED",
-        rationale: `Navigate to target application URL: ${defaultUrl}`
-      });
-    }
-
-    if (defaultUrl.includes("svkm") || defaultUrl.includes("portal")) {
-      // Grounded in the demonstration video:
-      // 1. Navigate to SVKM portal (Dynamic HITL Auth handles credentials with zero retention)
-      // 2. Post-login: Select Academic Session 'Semester V'
-      // 3. Post-login: Verify & extract Student Feedback card & Start Feedback button
-      filteredActions = [
-        {
-          action: "NAVIGATE",
-          arguments: { url: "https://portal.svkm.ac.in/usermgmt/login" },
-          application: "Browser",
-          evidenceEpisodeIds: [],
-          confidence: 1.0,
-          evidenceStatus: "OBSERVED",
-          rationale: "Navigate to SVKM user management portal"
-        },
-        {
-          action: "SELECT",
-          arguments: {
-            target: "Academic Session Dropdown",
-            selector: "select[name*='session' i], select[id*='session' i], select",
-            value: "Semester V",
-            option: "Semester V"
-          },
-          application: "Browser",
-          evidenceEpisodeIds: [],
-          confidence: 0.95,
-          evidenceStatus: "OBSERVED",
-          rationale: "Select Academic Session Semester V demonstrated in video"
-        },
-        {
-          action: "EXTRACT",
-          arguments: {
-            target: "Student Feedback Card & Start Feedback Button",
-            selector: ".card, .feedback-card, .container, :has-text('Student Feedback'), :has-text('Start Feedback'), body",
-            instruction: "Extract Student Feedback card status and Start Feedback button availability for Bachelor of Technology (Data Science)"
-          },
-          application: "Browser",
-          evidenceEpisodeIds: [],
-          confidence: 0.95,
-          evidenceStatus: "OBSERVED",
-          rationale: "Verify Student Feedback card and Start Feedback status on MPSTME homepage"
-        }
-      ];
-    } else {
-      // 4. Ensure verification / extract action is present for other workflows
-      const hasExtract = filteredActions.some(act =>
-        act.action.toUpperCase().includes("READ") ||
-        act.action.toUpperCase().includes("VERIFY") ||
-        act.action.toUpperCase().includes("EXTRACT")
-      );
-
-      if (!hasExtract) {
-        filteredActions.push({
-          action: "EXTRACT",
-          arguments: {
-            target: "Application Page Verification",
-            selector: "body",
-            instruction: "Verify page state and business data following interaction"
-          },
-          application: "Browser",
-          evidenceEpisodeIds: [],
-          confidence: 0.95,
-          evidenceStatus: "OBSERVED",
-          rationale: "Verify page state following interaction"
-        });
-      }
-    }
-
-    const actions = filteredActions;
-
-    const observations: Observation[] = actions.map((act, idx) => {
-      let bpiAction: Observation["action"] = "CLICK";
-      const actName = act.action.toUpperCase();
-
-      if (actName.includes("READ") || actName.includes("VERIFY") || actName.includes("EXTRACT") || actName.includes("OBSERVE")) {
-        bpiAction = "EXTRACT";
-      } else if (actName.includes("NAVIGATE") || actName.includes("OPEN_URL") || act.arguments?.url) {
-        bpiAction = "NAVIGATE";
-      } else if (actName.includes("TYPE") || actName.includes("ENTER") || actName.includes("INPUT")) {
-        bpiAction = "INPUT";
-      } else if (act.arguments?.value && (actName === "INPUT" || actName === "TYPE")) {
-        bpiAction = "INPUT";
-      } else {
-        bpiAction = "CLICK";
-      }
-
-      const targetText = act.arguments?.target || act.arguments?.name || act.action.replace(/_/g, " ");
-      const selector = this.deriveSelectorFromSemanticAction(act, bpiAction);
-
+  /** Splits the evidence into chronological segments that each fit one vision request. */
+  private buildSegments(packet: SemanticEvidencePacket, frames: FrameEvidence[], perRequest: number): SemanticEvidencePacket[] {
+    const timed = packet.timedOcr || [];
+    const make = (keyFrames: FrameEvidence[], episodes: EvidenceEpisode[], start: number, end: number): SemanticEvidencePacket => {
+      const ocr = timed.filter(o => typeof o.timestamp !== "number" || (o.timestamp >= start && o.timestamp < end));
       return {
-        sequence: idx + 1,
-        timestamp: `${idx * 1.5}`,
-        action: bpiAction,
-        context: {
-          url: act.arguments?.url || (isBrowser ? defaultUrl : ""),
-          page_title: targetText,
-          application: act.application || (isBrowser ? "Browser" : "Desktop")
-        },
-        target: {
-          dom_evidence: {
-            tag: isBrowser ? "browser_element" : "desktop_control",
-            name: targetText,
-            role: bpiAction,
-            text: targetText,
-            attributes: {
-              selector,
-              application: act.application || "Browser"
-            }
-          }
-        },
-        value: act.arguments?.value ? {
-          raw_value: String(act.arguments.value),
-          is_sensitive: String(targetText).toLowerCase().includes("pass"),
-          placeholder: targetText,
-          classification: {
-            value: "RUNTIME_VARIABLE",
-            confidence: act.confidence,
-            classification: "INFERRED_RULE",
-            evidence: []
-          },
-          inferred_type: {
-            value: "string",
-            confidence: 0.9,
-            classification: "INFERRED_RULE",
-            evidence: []
-          },
-          semanticRole: {
-            value: "input_data",
-            confidence: 0.9,
-            classification: "INFERRED_RULE",
-            evidence: []
-          }
-        } : undefined,
-        application: act.application,
-        action_type: bpiAction,
-        inference_status: act.evidenceStatus,
-        frame_ids: act.evidenceEpisodeIds,
-        start_timestamp: idx * 1.5,
-        end_timestamp: (idx + 1) * 1.5,
-        rationale: act.rationale || `Semantic action inferred from episode ${act.evidenceEpisodeIds.join(",")}`
-      } as any;
-    });
+        ...packet,
+        packetId: `${packet.packetId}_${start.toFixed(1)}`,
+        episodes,
+        keyFrames,
+        timedOcr: ocr,
+        ocrFacts: ocr.map(o => o.text),
+        timestamps: { start, end: Number.isFinite(end) ? end : (packet.timestamps.end ?? start) }
+      };
+    };
 
+    if (frames.length <= perRequest) {
+      return [make(frames, packet.episodes, Number.NEGATIVE_INFINITY, Number.POSITIVE_INFINITY)].map(s => ({ ...s, timestamps: packet.timestamps }));
+    }
+
+    const segments: SemanticEvidencePacket[] = [];
+    for (let i = 0; i < frames.length; i += perRequest) {
+      const chunk = frames.slice(i, i + perRequest);
+      const start = i === 0 ? Number.NEGATIVE_INFINITY : chunk[0]!.timestamp;
+      const next = frames[i + perRequest];
+      const end = next ? next.timestamp : Number.POSITIVE_INFINITY;
+      const episodes = packet.episodes.filter(ep => {
+        const t = (ep.timestampStart + ep.timestampEnd) / 2;
+        return t >= start && t < end;
+      });
+      const segment = make(chunk, episodes, start, end);
+      segment.timestamps = { start: chunk[0]!.timestamp, end: chunk[chunk.length - 1]!.timestamp };
+      segments.push(segment);
+    }
+    return segments;
+  }
+
+  private fingerprintMedia(mediaPath: string, jobId: string): string {
+    try {
+      const stat = fs.statSync(mediaPath);
+      return `${path.basename(mediaPath)}:${stat.size}:${stat.mtimeMs}`;
+    } catch {
+      return `job:${jobId}`;
+    }
+  }
+
+  /** A checkpoint is valid only for the same media, evidence, prompt version and model. */
+  private segmentKey(segment: SemanticEvidencePacket, mediaFingerprint: string): string {
+    return createHash("sha256").update(JSON.stringify({
+      prompt: SEMANTIC_EXTRACTION_PROMPT_VERSION,
+      model: this.config.openRouterVisionModel,
+      media: mediaFingerprint,
+      context: segment.taskContext,
+      frames: (segment.keyFrames || []).map(f => `${f.frameId}@${f.timestamp}`),
+      episodes: segment.episodes.map(e => e.episodeId),
+      preceding: segment.precedingActions || []
+    })).digest("hex");
+  }
+
+  private loadSegment(dir: string | undefined, index: number, key: string): SemanticActionsResult | undefined {
+    if (!dir) return undefined;
+    try {
+      const file = path.join(dir, `segment_${index}.json`);
+      if (!fs.existsSync(file)) return undefined;
+      const data = JSON.parse(fs.readFileSync(file, "utf8")) as SegmentCheckpoint;
+      return data.key === key ? data.result : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private saveSegment(dir: string | undefined, index: number, key: string, result: SemanticActionsResult): void {
+    if (!dir) return;
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      const checkpoint: SegmentCheckpoint = { key, result, completedAt: new Date().toISOString() };
+      fs.writeFileSync(path.join(dir, `segment_${index}.json`), JSON.stringify(checkpoint), "utf8");
+    } catch (err: any) {
+      logger.warn({ err: err.message, index }, "[EvidencePipeline] Could not persist segment checkpoint");
+    }
+  }
+
+  private sameAction(a: SemanticAction, b: SemanticAction): boolean {
+    return normalizeText(a.action) === normalizeText(b.action) &&
+      normalizeText(a.arguments?.target) === normalizeText(b.arguments?.target) &&
+      normalizeText(a.arguments?.value) === normalizeText(b.arguments?.value) &&
+      normalizeText(a.arguments?.url) === normalizeText(b.arguments?.url);
+  }
+
+  private isFirstOfSegment(result: SemanticActionsResult, action: SemanticAction): boolean {
+    return result.semanticActions[0] === action;
+  }
+
+  /**
+   * Builds the BPI demonstration from grounded actions. Every grounded action becomes exactly one
+   * observation carrying its evidence; nothing is synthesised and nothing is dropped.
+   */
+  private demonstrationFromGrounding(
+    grounding: GroundingReport,
+    processUnderstanding: ProcessUnderstandingResult,
+    ocrFacts: OcrFact[],
+    context: { jobId: string; tenantId: string }
+  ): NormalizedDemonstration {
+    const ocrUrls = ocrFacts.flatMap(f => extractUrlCandidates(f.text || "").map(url => ({ url, timestamp: f.timestamp })));
+    const firstNav = grounding.actions.find(g => g.action === "NAVIGATE" && g.url === grounding.destination?.url);
+    const destination = refineUrlWithOcr(grounding.destination?.url, ocrUrls, firstNav?.evidence.timestampEnd);
+    const isBrowser = /browser|web/i.test(processUnderstanding.applicationEnvironment || "") || Boolean(destination);
+    const observations = grounding.actions.map(g => this.observationFromGrounded(g, {
+      url: g.action === "NAVIGATE" ? refineUrlWithOcr(g.url, ocrUrls, g.evidence.timestampEnd) : destination,
+      isBrowser
+    }));
     return {
       recording_id: context.jobId,
       tenant_id: context.tenantId,
@@ -482,103 +619,96 @@ export class EvidenceToWorkflowPipeline {
     };
   }
 
-  private deriveSelectorFromSemanticAction(act: SemanticAction, bpiAction: string): string {
-    if (act.arguments?.selector) {
-      return String(act.arguments.selector);
-    }
-    const rawTarget = String(act.arguments?.target || act.arguments?.name || act.action || "").trim();
-    const rawLower = rawTarget.toLowerCase();
+  private observationFromGrounded(g: GroundedAction, ctx: { url: string | undefined; isBrowser: boolean }): Observation {
+    const targetText = g.target?.text || g.target?.label || "";
+    const description = this.describe(g);
+    return {
+      sequence: g.index + 1,
+      timestamp: g.evidence.timestampStart !== undefined ? String(g.evidence.timestampStart) : "",
+      action: BPI_ACTION[g.action] || "CLICK",
+      context: {
+        url: ctx.url || "",
+        page_title: description,
+        application: g.application
+      },
+      target: {
+        dom_evidence: {
+          tag: ctx.isBrowser ? "browser_element" : "desktop_control",
+          name: targetText,
+          role: g.target?.role || g.action,
+          text: targetText,
+          attributes: { selector: g.target?.selector || "", application: g.application }
+        }
+      },
+      value: g.value ? {
+        raw_value: g.value,
+        is_sensitive: /pass(word)?|pwd|otp|pin\b/i.test(targetText),
+        placeholder: targetText,
+        classification: { value: "RUNTIME_VARIABLE", confidence: g.confidence, classification: "INFERRED_RULE", evidence: [] },
+        inferred_type: { value: "string", confidence: 0.9, classification: "INFERRED_RULE", evidence: [] },
+        semanticRole: { value: "input_data", confidence: 0.9, classification: "INFERRED_RULE", evidence: [] }
+      } : undefined,
+      application: g.application,
+      action_type: g.action,
+      inference_status: g.basis,
+      frame_ids: g.evidence.frameIds,
+      start_timestamp: g.evidence.timestampStart,
+      end_timestamp: g.evidence.timestampEnd,
+      rationale: g.rationale,
+      grounding: g
+    } as any;
+  }
 
-    if (rawLower.includes("user") || rawLower.includes("username")) {
-      return "#user-name, [data-test='username'], input[name='username'], input[name='user-name'], input[type='text']";
+  private describe(g: GroundedAction): string {
+    const target = g.target?.text || g.target?.label;
+    switch (g.action) {
+      case "NAVIGATE": return `Open ${g.url || "the demonstrated address"}`;
+      case "TYPE": return `Enter ${/pass(word)?|pwd|otp/i.test(target || "") ? "the credential" : `"${g.value ?? ""}"`} into ${target ? `"${target}"` : "the field"}`;
+      case "SELECT": return `Choose "${g.value ?? ""}" in ${target ? `"${target}"` : "the list"}`;
+      case "CLICK": return `Click ${target ? `"${target}"` : "the demonstrated control"}`;
+      case "KEYPRESS": return `Press ${g.value || "the demonstrated key"}${target ? ` in "${target}"` : ""}`;
+      case "EXTRACT": return `Read ${target ? `"${target}"` : "the displayed result"}`;
+      case "VERIFY": return `Confirm ${target ? `"${target}"` : "the expected state"}`;
+      case "WAIT": return "Wait for the page to update";
+      case "SCROLL": return `Scroll${target ? ` to "${target}"` : ""}`;
+      default: return g.rationale || g.rawAction;
     }
-    if (rawLower.includes("password") || rawLower.includes("pass")) {
-      return "#password, [data-test='password'], input[name='password'], input[type='password']";
-    }
-    if (rawLower.includes("login") || rawLower.includes("sign-in") || rawLower.includes("signin") || rawLower.includes("submit")) {
-      return "#login-button, [data-test='login-button'], button[type='submit'], input[type='submit']";
-    }
-    if (rawLower.includes("backpack") || rawLower.includes("item-4") || rawLower.includes("item 4")) {
-      return "#item_4_title_link, [data-test='item-4-title-link'], a:has-text('Sauce Labs Backpack'), .inventory_item_name";
-    }
-    if (rawLower.includes("add to cart") || rawLower.includes("add-to-cart") || rawLower.includes("add cart")) {
-      return "#add-to-cart, #add-to-cart-sauce-labs-backpack, [data-test='add-to-cart'], button:has-text('Add to cart')";
-    }
-    if (rawLower.includes("shopping cart") || rawLower.includes("cart icon") || rawLower.includes("cart link") || (rawLower.includes("cart") && !rawLower.includes("add"))) {
-      return ".shopping_cart_link, [data-test='shopping-cart-link'], a.shopping_cart_link";
-    }
-    if (rawLower.includes("checkout")) {
-      return "#checkout, [data-test='checkout'], button:has-text('Checkout'), a:has-text('Checkout')";
-    }
-    if (rawLower.includes("first-name") || rawLower.includes("firstname") || rawLower.includes("first name")) {
-      return "#first-name, [data-test='firstName'], input[name='firstName']";
-    }
-    if (rawLower.includes("last-name") || rawLower.includes("lastname") || rawLower.includes("last name")) {
-      return "#last-name, [data-test='lastName'], input[name='lastName']";
-    }
-    if (rawLower.includes("postal") || rawLower.includes("zip") || rawLower.includes("postal-code") || rawLower.includes("zipcode")) {
-      return "#postal-code, [data-test='postalCode'], input[name='postalCode']";
-    }
-    if (rawLower.includes("continue")) {
-      return "#continue, [data-test='continue'], input[type='submit'][value='Continue'], button:has-text('Continue')";
-    }
-    if (rawLower.includes("finish")) {
-      return "#finish, [data-test='finish'], button:has-text('Finish')";
-    }
-    if (rawLower.includes("total") || rawLower.includes("summary") || rawLower.includes("overview")) {
-      return ".summary_total_label, [data-test='total-label'], .summary_info, .oxd-topbar-header-breadcrumb";
-    }
+  }
 
-    if (rawLower.includes("product") || rawLower.includes("item") || rawLower.includes("mouse") || rawLower.includes("result") || rawLower.includes("search")) {
-      return "div[data-component-type='s-search-result'], h2 a, .s-result-item, [data-component-type='s-search-result'] h2 a, body";
+  /**
+   * Converts semantic actions into a BPI demonstration (used by callers that already hold model
+   * output). Actions are grounded against the supplied OCR; none are added or removed.
+   */
+  public toNormalizedDemonstration(
+    semanticActions: SemanticAction[],
+    processUnderstanding: ProcessUnderstandingResult,
+    context: {
+      jobId: string;
+      mediaName: string;
+      tenantId: string;
+      ocrFacts?: Array<{ text: string; timestamp?: number }> | undefined;
+      rawObservations?: RawVisualObservation[] | undefined;
+      userObjective?: string | undefined;
     }
-    if (rawLower.includes("price") || rawLower.includes("rating") || rawLower.includes("spec") || rawLower.includes("compare")) {
-      return ".a-price, .a-price-whole, div[data-component-type='s-search-result'], body";
-    }
-
-    const orangeSections = ["admin", "pim", "leave", "time", "recruitment", "my info", "performance", "dashboard", "directory", "maintenance", "claim", "buzz"];
-    for (const sec of orangeSections) {
-      if (rawLower.includes(sec)) {
-        const titleCase = sec.split(" ").map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
-        return `a.oxd-main-menu-item:has-text('${titleCase}'), a.oxd-main-menu-item[href*='${sec.replace(/\s+/g, "")}'], a:has-text('${titleCase}'), [data-test*='${sec}']`;
-      }
-    }
-
-    // Fulfillment Auditor domain mappings
-    if (rawLower.includes("order") || rawLower.includes("order-id") || rawLower.includes("ordernumber")) {
-      return "[data-test*='order'], input[name*='order'], input[placeholder*='Order'], .order-number, #order-search, tr[data-order-id], td.order-id";
-    }
-    if (rawLower.includes("status") || rawLower.includes("fulfillment")) {
-      return "[data-test*='status'], select[name*='status'], .status-badge, .badge, [aria-label*='status'], td.status";
-    }
-    if (rawLower.includes("sku") || rawLower.includes("item-code") || rawLower.includes("inventory")) {
-      return "[data-test*='sku'], input[name*='sku'], input[placeholder*='SKU'], .sku-cell, [data-test*='item']";
-    }
-    if (rawLower.includes("tracking") || rawLower.includes("carrier") || rawLower.includes("shipment")) {
-      return "[data-test*='tracking'], input[name*='tracking'], .tracking-number, [placeholder*='Tracking'], .shipment-info";
-    }
-    if (rawLower.includes("audit") || rawLower.includes("approve") || rawLower.includes("flag") || rawLower.includes("verify")) {
-      return "button:has-text('Audit'), button:has-text('Approve'), button:has-text('Confirm'), button:has-text('Flag'), button:has-text('Verify'), [data-test*='audit'], [data-test*='approve']";
-    }
-    if (rawLower.includes("qty") || rawLower.includes("quantity")) {
-      return "input[name*='qty'], input[name*='quantity'], [data-test*='quantity']";
-    }
-
-    if (bpiAction === "EXTRACT") {
-      return ".order-row, [data-test*='order'], table tbody tr, .status-badge, .summary_total_label, .a-price, div[data-component-type='s-search-result'], main, body";
-    }
-
-    const clean = rawTarget.replace(/^(?:click|press|submit|select|open|add|type|enter|fill)\s+/i, '')
-      .replace(/["'\.\:;]/g, '')
-      .trim();
-    const slug = clean.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-
-    if (bpiAction === "INPUT") {
-      return slug ? `input[name='${slug}'], [data-test*='${slug}'], #${slug}, input:not([type='hidden'])` : "input:not([type='hidden'])";
-    }
-    if (bpiAction === "CLICK") {
-      return slug ? `[data-test*='${slug}'], #${slug}, button:has-text('${clean}'), a:has-text('${clean}'), span:has-text('${clean}'), label:has-text('${clean}'), [aria-label*='${clean}'], a.oxd-main-menu-item:has-text('${clean}')` : "button, a, span";
-    }
-    return `[data-test*='${slug}'], #${slug}`;
+  ): NormalizedDemonstration {
+    const ocrFacts: OcrFact[] = (context.ocrFacts || []).map(o => ({ text: o.text, timestamp: o.timestamp }));
+    const packet: SemanticEvidencePacket = {
+      packetId: `pkt_${context.jobId}`,
+      taskContext: context.userObjective || "",
+      activeApplication: processUnderstanding.applicationEnvironment || "Browser",
+      episodes: [],
+      ocrFacts: ocrFacts.map(o => o.text),
+      timedOcr: dedupeOcr(ocrFacts),
+      confidence: processUnderstanding.confidence ?? 0,
+      timestamps: { start: 0, end: 0 }
+    };
+    const grounding = groundSemanticActions({
+      actions: semanticActions,
+      packet,
+      ocrFacts,
+      userObjective: context.userObjective,
+      modelObjective: processUnderstanding.taskIntent
+    });
+    return this.demonstrationFromGrounding(grounding, processUnderstanding, ocrFacts, { jobId: context.jobId, tenantId: context.tenantId });
   }
 }

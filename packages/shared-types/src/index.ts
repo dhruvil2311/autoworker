@@ -9,7 +9,7 @@ export type ApiError = {
 export type AuthContext = {
   userId: string;
   tenantId: string;
-  role: "owner" | "admin" | "operator" | "viewer" | "worker";
+  role: "owner" | "admin" | "builder" | "operator" | "auditor" | "member" | "viewer" | "worker";
 };
 
 export type QueueJob =

@@ -12,6 +12,28 @@ export interface ExecutionPersistence {
   saveCheckpoint(cursor: string, contextState: RuntimeContextState, iterationPath: number[]): Promise<void>;
   loadCheckpoint(): Promise<{ cursor: string; contextState: RuntimeContextState; iterationPath: number[] } | null>;
   hasStepCompleted(stepId: string): Promise<boolean>;
+  /** Last recorded state of a step fingerprint (e.g. RUNNING if a crash interrupted it). */
+  getStepState?(stepId: string): Promise<string | undefined>;
+  /** Returns a reason when the run must stop (cancelled, superseded, timed out); checked before every step. */
+  shouldStop?(): Promise<string | null>;
+}
+
+/** Thrown when the run was stopped externally; no further step may execute. */
+export class RunStoppedError extends Error {
+  constructor(public readonly reason: string) {
+    super(`Run stopped: ${reason}`);
+    this.name = "RunStoppedError";
+  }
+}
+
+/** Operations that change state outside the runtime; they are never retried automatically after an interruption. */
+const SIDE_EFFECT_OPERATIONS = new Set([
+  "CLICK", "TYPE", "SELECT", "PRESS_KEY", "HOTKEY", "SUBMIT", "UPLOAD", "UPLOAD_FILE", "DOWNLOAD", "CALL_API", "CALL_MCP", "ACT",
+  "SAVE_FILE", "PASTE", "DRAG", "DOUBLE_CLICK", "RIGHT_CLICK"
+]);
+
+function isSideEffecting(step: WorkflowV2Step): boolean {
+  return Boolean(step.args?.irreversible) || SIDE_EFFECT_OPERATIONS.has(step.operation) || String(step.operation).startsWith("DESKTOP_") && !/READ|SCREENSHOT|WAIT|ASSERT|FOCUS/.test(step.operation);
 }
 
 export class WorkflowRuntime {
@@ -22,12 +44,16 @@ export class WorkflowRuntime {
   private iterationPath: number[] = [];
   private isResuming = false;
 
+  private initialInputs: Record<string, any>;
+
   constructor(
     private plan: ExecutionPlan,
     private persistence: ExecutionPersistence,
     private capabilities: ExecutionCapability[],
-    initialContextState?: RuntimeContextState
+    initialContextState?: RuntimeContextState,
+    private retryDelayMs: number = 1000
   ) {
+    this.initialInputs = { ...(initialContextState?.inputs || {}) };
     this.context = new RuntimeContext(initialContextState || {
       inputs: {}, variables: {}, outputs: {}, artifacts: {}, scopes: [],
       executionMetadata: { runId: "", tenantId: "", workflowVersionId: plan.workflowVersionId }
@@ -45,7 +71,12 @@ export class WorkflowRuntime {
       this.cursor = checkpoint.cursor;
       this.resumeIterationPath = checkpoint.iterationPath;
       this.iterationPath = [];
-      this.context = new RuntimeContext(checkpoint.contextState);
+      // Inputs supplied for this attempt (HITL decisions, provided values) take precedence over the
+      // inputs captured when the checkpoint was written; otherwise an approval would be lost on resume.
+      this.context = new RuntimeContext({
+        ...checkpoint.contextState,
+        inputs: { ...(checkpoint.contextState?.inputs || {}), ...this.initialInputs }
+      });
     }
 
     await this.persistence.recordRunState("RUNNING");
@@ -66,10 +97,19 @@ export class WorkflowRuntime {
       console.log(`[WorkflowRuntime] Recording terminal run state:`, result.state);
       await this.persistence.recordRunState(result.state);
     } catch (e: any) {
+      if (e instanceof RunStoppedError) {
+        // The run was stopped externally (its state is already terminal); record nothing further.
+        console.log(`[WorkflowRuntime] ${e.message}`);
+        this.stopReason = e.reason;
+        return;
+      }
       console.error(`[WorkflowRuntime] Execution caught an error!`, e);
       await this.persistence.recordRunState("FAILED", { error: e.message });
     }
   }
+
+  /** Set when execution ended because the run was stopped externally. */
+  public stopReason: string | null = null;
 
   private async executeNode(step: WorkflowV2Step): Promise<ExecutionResult> {
     const fingerprint = this.getStepFingerprint(step.id);
@@ -150,6 +190,11 @@ export class WorkflowRuntime {
   }
 
   private async executeLeaf(step: WorkflowV2Step): Promise<ExecutionResult> {
+    if (this.persistence.shouldStop) {
+      const reason = await this.persistence.shouldStop();
+      if (reason) throw new RunStoppedError(reason);
+    }
+
     const capability = this.capabilities.find(c => c.canExecute(step, this.context));
 
     if (!capability) {
@@ -157,21 +202,48 @@ export class WorkflowRuntime {
     }
 
     const fingerprint = this.getStepFingerprint(step.id);
+    const decision = this.context.get(`hitl_response_${step.id}`);
+
+    // A human confirmed this step already happened (e.g. performed manually during takeover).
+    if (decision?.action === "PROVIDE_VALUE" && decision.value === "ALREADY_DONE") {
+      await this.persistence.recordStepCompleted(fingerprint, "SUCCEEDED", "HUMAN_CONFIRMED", "Confirmed complete by a human operator");
+      return { state: "SUCCEEDED" };
+    }
+
+    // A side-effecting step that started but never recorded an outcome may already have taken
+    // effect. Repeating it blindly could duplicate the change, so a human must confirm first.
+    if (!decision && isSideEffecting(step) && this.persistence.getStepState) {
+      const prior = await this.persistence.getStepState(fingerprint);
+      if (prior === "RUNNING") {
+        const message = `Step "${step.description}" was interrupted before its outcome was recorded. Confirm whether it took effect (ALREADY_DONE) or approve a retry.`;
+        await this.persistence.recordStepCompleted(fingerprint, "PAUSED_FOR_HUMAN", step.target, message);
+        await this.persistence.recordHitlPause(step.id, "INTERRUPTED_SIDE_EFFECT_UNVERIFIED");
+        await this.persistence.saveCheckpoint(step.id, this.context.getState(), [...this.iterationPath]);
+        return { state: "PAUSED_FOR_HUMAN", hitlReason: "INTERRUPTED_SIDE_EFFECT_UNVERIFIED", message };
+      }
+    }
+
     await this.persistence.recordStepStarted(fingerprint);
 
-    let result: ExecutionResult;
-    try {
-      result = await capability.execute(step, this.context);
-    } catch (e: any) {
-      if (e.name === "MissingVariableError") {
-        result = {
-          state: "PAUSED_FOR_HUMAN",
-          hitlReason: "MISSING_RUNTIME_VALUE",
-          message: e.message
-        };
-      } else {
-        result = { state: "FAILED", message: e.message };
+    // Bounded automatic retries for failures of steps that are safe to repeat.
+    const retryLimit = step.args?.irreversible ? 0 : Math.max(0, Math.min(step.failure_policy?.retry_limit ?? 0, 5));
+    let result: ExecutionResult = { state: "FAILED", message: "Step did not run" };
+    for (let attempt = 0; attempt <= retryLimit; attempt++) {
+      try {
+        result = await capability.execute(step, this.context);
+      } catch (e: any) {
+        if (e.name === "MissingVariableError") {
+          result = {
+            state: "PAUSED_FOR_HUMAN",
+            hitlReason: "MISSING_RUNTIME_VALUE",
+            message: e.message
+          };
+        } else {
+          result = { state: "FAILED", message: e.message };
+        }
       }
+      if (result.state !== "FAILED" || attempt === retryLimit) break;
+      await new Promise(r => setTimeout(r, this.retryDelayMs * Math.pow(2, attempt)));
     }
 
     if (result.state === "SUCCEEDED") {
@@ -194,7 +266,11 @@ export class WorkflowRuntime {
       await this.persistence.recordHitlPause(step.id, result.hitlReason || "STEP_FAILURE_POLICY_PAUSE");
       await this.persistence.saveCheckpoint(step.id, this.context.getState(), [...this.iterationPath]);
     } else {
-      await this.persistence.recordStepCompleted(fingerprint, "FAILED", step.target, result.message);
+      // Failure evidence (e.g. which success criteria were not met) stays available to the caller.
+      if (result.outputs) {
+        for (const [k, v] of Object.entries(result.outputs)) this.context.set(k, v);
+      }
+      await this.persistence.recordStepCompleted(fingerprint, "FAILED", step.target, result.message, result.outputs);
     }
 
     return result;

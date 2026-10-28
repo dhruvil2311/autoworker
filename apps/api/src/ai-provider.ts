@@ -248,6 +248,8 @@ export function getLLMCandidates(config: ApiConfig): LLMEndpointCandidate[] {
   return candidates;
 }
 
+const providerCooldowns = new Map<string, number>();
+
 export class RealSemanticBPIProvider implements SemanticBPIProvider {
   private readonly timeoutMs: number = 20_000;
   private readonly maxRetries: number = 2;
@@ -310,6 +312,11 @@ export class RealSemanticBPIProvider implements SemanticBPIProvider {
 
     for (let i = 0; i < candidates.length; i++) {
       const candidate = candidates[i]!;
+      const cooldownUntil = providerCooldowns.get(candidate.provider);
+      if (cooldownUntil && cooldownUntil > Date.now()) {
+        continue;
+      }
+
       try {
         const isMinimax = candidate.model.toLowerCase().includes("minimax");
         const reqBody: any = {
@@ -354,6 +361,11 @@ export class RealSemanticBPIProvider implements SemanticBPIProvider {
             errorText.toLowerCase().includes("quota") ||
             errorText.toLowerCase().includes("rate limit") ||
             errorText.toLowerCase().includes("resource_exhausted");
+
+          if (isRateLimit) {
+            const cooldownMs = errorText.toLowerCase().includes("free-models-per-day") ? 15 * 60_000 : 2 * 60_000;
+            providerCooldowns.set(candidate.provider, Date.now() + cooldownMs);
+          }
 
           const reason = isRateLimit ? " (QUOTA EXCEEDED / 429)" : (response.status === 404 ? " (MODEL NOT FOUND / DEPRECATED)" : "");
           const truncatedMsg = errorMsg ? `: ${errorMsg.slice(0, 120)}` : "";

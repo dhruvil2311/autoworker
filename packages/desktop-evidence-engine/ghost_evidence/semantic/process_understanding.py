@@ -80,14 +80,9 @@ class ProcessUnderstandingEngine:
 
         contradictions = self.ambiguity_engine.detect_contradictions(raw_observations)
 
-        # 7. Formulate business rules
+        # 7. Business rules are not inferred from which applications appear on screen; rules come
+        # only from explicit evidence or the user's instructions, never from templates.
         business_rules: List[str] = []
-        if "Excel" in apps_involved and ("ERP" in apps_involved or "Tally" in apps_involved):
-            business_rules.append("Order records must be read from Excel before entering into ERP/Tally.")
-        if any("save" in a.summary.lower() for a in semantic_actions):
-            business_rules.append("Every transaction must be explicitly committed and verified after entry.")
-        if "Browser" in apps_involved:
-            business_rules.append("Completed invoices must be uploaded to the portal after system entry.")
 
         avg_confidence = (
             sum(a.confidence for a in semantic_actions) / len(semantic_actions)
@@ -115,15 +110,9 @@ class ProcessUnderstandingEngine:
         )
 
     def _infer_task_intent(self, actions: List[SemanticEvent], apps: List[str]) -> str:
+        # The set of applications on screen does not reveal the user's goal. Report only that a
+        # procedure was observed; the goal must come from the user or from grounded reasoning.
         app_str = " -> ".join(apps) if apps else "Desktop Task"
-        if "Excel" in apps and ("Tally" in apps or "SAP" in apps or "ERP" in apps):
-            return "Process and post customer orders from spreadsheet into accounting ERP"
-        elif "Browser" in apps and "Excel" in apps:
-            return "Extract data from browser portal into spreadsheet report"
-        elif "Tally" in apps:
-            return "Create and verify accounting voucher in Tally"
-        elif "Excel" in apps:
-            return "Automate spreadsheet data calculation and formatting"
         return f"Autonomous multi-step procedure across {app_str}"
 
     def _generate_process_name(self, intent: str, apps: List[str]) -> str:

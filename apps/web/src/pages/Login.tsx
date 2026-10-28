@@ -39,7 +39,7 @@ export function Login() {
         setError(signInError.message);
         setLoading(false);
       } else {
-        navigate("/workforce");
+        navigate("/app");
       }
     }
   };

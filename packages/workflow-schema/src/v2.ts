@@ -193,6 +193,15 @@ export const workflowV2Schema = z.object({
   
   output_contract: outputContractSchema.optional(),
 
+  // Observable conditions that must hold after execution for the outcome to count as verified.
+  success_criteria: z.array(z.object({
+    id: z.string(),
+    type: z.enum(["URL_CONTAINS", "TEXT_VISIBLE"]),
+    value: z.string().min(1),
+    source: z.enum(["USER_OBJECTIVE", "DEMONSTRATION_FINAL_STATE"]),
+    evidenceFrameIds: z.array(z.string()).default([])
+  })).optional(),
+
   root_step: workflowV2StepSchema,
   
   compiler: z.object({
