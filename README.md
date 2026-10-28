@@ -229,5 +229,3 @@ For full relational diagrams and policy documentation, refer to [docs/DATABASE_A
 - [Contributing Guidelines](file:///d:/GHOST_WORKING_VS_fixed_copy1/GHOST_WORKING_VS_fixed_copy/GHOST_WORKING_VS_fixed/CONTRIBUTING.md)
 - [Security Policy](file:///d:/GHOST_WORKING_VS_fixed_copy1/GHOST_WORKING_VS_fixed_copy/GHOST_WORKING_VS_fixed/SECURITY.md)
 - [License Draft](file:///d:/GHOST_WORKING_VS_fixed_copy1/GHOST_WORKING_VS_fixed_copy/GHOST_WORKING_VS_fixed/LICENSE)
-- [Video Demonstration Extraction Specification](file:///d:/GHOST_WORKING_VS_fixed_copy1/GHOST_WORKING_VS_fixed_copy/GHOST_WORKING_VS_fixed/VIDEO_EXTRACTION_ARCHITECTURE.md)
-- [Desktop Evidence Intelligence Specification](file:///d:/GHOST_WORKING_VS_fixed_copy1/GHOST_WORKING_VS_fixed_copy/GHOST_WORKING_VS_fixed/docs/DESKTOP_EVIDENCE_INTELLIGENCE_ARCHITECTURE.md)
